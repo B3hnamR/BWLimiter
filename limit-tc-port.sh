@@ -3,6 +3,7 @@
 set -u
 
 APP_NAME="limit-tc-port"
+APP_AUTHOR="Behnam (@b3hnamrjd)"
 CONFIG_DIR="/etc/limit-tc-port"
 CONFIG_FILE="$CONFIG_DIR/config"
 RULES_DB="$CONFIG_DIR/rules.db"
@@ -919,6 +920,7 @@ render_dashboard() {
 
   echo -e "${BLUE}======================================================================${RESET}"
   echo -e " ${MAGENTA}BWLimiter Control Center${RESET}   ${DIM}host:${host_name}${RESET}"
+  echo -e " ${DIM}Developed by: ${APP_AUTHOR}${RESET}"
   echo -e "${BLUE}======================================================================${RESET}"
   echo -e " ${CYAN}Network Snapshot${RESET}"
   printf "   Interface      : %s\n" "$selected_interface"
@@ -945,6 +947,7 @@ render_dashboard() {
 show_help() {
   cat <<EOF
 $APP_NAME - Port bandwidth manager using tc/ifb
+Developed by: $APP_AUTHOR
 
 Usage:
   $APP_NAME                  # interactive menu
