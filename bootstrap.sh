@@ -132,7 +132,10 @@ setup_service_if_available() {
 
 launch_menu() {
   ok "Launching interactive manager..."
-  exec "$APP_BIN"
+  if [[ -r /dev/tty ]]; then
+    exec </dev/tty >/dev/tty 2>/dev/tty "$APP_BIN"
+  fi
+  warn "No interactive TTY detected. Run manually: sudo $APP_BIN"
 }
 
 main() {
@@ -144,4 +147,3 @@ main() {
 }
 
 main "$@"
-
