@@ -920,7 +920,7 @@ render_dashboard() {
 
   echo -e "${BLUE}======================================================================${RESET}"
   echo -e " ${MAGENTA}BWLimiter Control Center${RESET}   ${DIM}host:${host_name}${RESET}"
-  echo -e " ${DIM}Developed by: ${APP_AUTHOR}${RESET}"
+  echo -e " ${YELLOW}Developed by: ${APP_AUTHOR}${RESET}"
   echo -e "${BLUE}======================================================================${RESET}"
   echo -e " ${CYAN}Network Snapshot${RESET}"
   printf "   Interface      : %s\n" "$selected_interface"
