@@ -18,6 +18,9 @@ RED="\033[1;31m"
 GREEN="\033[1;32m"
 CYAN="\033[1;36m"
 YELLOW="\033[1;33m"
+BLUE="\033[1;34m"
+MAGENTA="\033[1;35m"
+DIM="\033[2m"
 RESET="\033[0m"
 
 ts() {
@@ -743,30 +746,52 @@ EOF
   print_ok "Script installed: $BIN_PATH"
 }
 
+pause_enter() {
+  echo
+  read -r -p "Press Enter to continue..." _
+}
+
+menu_header() {
+  local title="$1"
+  local bar="======================================================================"
+  clear
+  echo -e "${BLUE}${bar}${RESET}"
+  printf "%s\n" " ${MAGENTA}${title}${RESET}"
+  echo -e "${BLUE}${bar}${RESET}"
+}
+
+badge_state() {
+  case "$1" in
+    UP|ON|enabled) echo -e "${GREEN}$1${RESET}" ;;
+    DOWN|OFF|disabled|MISSING) echo -e "${RED}$1${RESET}" ;;
+    *) echo -e "${YELLOW}$1${RESET}" ;;
+  esac
+}
+
 service_menu() {
   local choice
   if ! has_systemd; then
     print_err "systemctl not found. Service menu is unavailable."
+    pause_enter
     return 1
   fi
   while true; do
-    echo
-    echo "Service Menu"
-    echo "[1] Install/Update service files"
-    echo "[2] Enable + Start service"
-    echo "[3] Restart service"
-    echo "[4] Stop + Disable service"
-    echo "[5] Service status"
-    echo "[0] Back"
-    choice="$(prompt_input "Choice" "0")"
+    menu_header "Service Operations"
+    echo "[I] Install/Update service files"
+    echo "[E] Enable + Start service"
+    echo "[R] Restart service"
+    echo "[D] Disable + Stop service"
+    echo "[S] Show service status"
+    echo "[B] Back"
+    choice="$(to_lower "$(prompt_input "Action" "b")")"
     case "$choice" in
-      1) install_or_update_service ;;
-      2) systemctl enable --now limit-tc-port.service && print_ok "Service enabled and started." ;;
-      3) systemctl restart limit-tc-port.service && print_ok "Service restarted." ;;
-      4) systemctl disable --now limit-tc-port.service && print_ok "Service stopped and disabled." ;;
-      5) systemctl status --no-pager limit-tc-port.service || true ;;
-      0) return ;;
-      *) echo "Invalid option." ;;
+      i) install_or_update_service; pause_enter ;;
+      e) systemctl enable --now limit-tc-port.service && print_ok "Service enabled and started."; pause_enter ;;
+      r) systemctl restart limit-tc-port.service && print_ok "Service restarted."; pause_enter ;;
+      d) systemctl disable --now limit-tc-port.service && print_ok "Service stopped and disabled."; pause_enter ;;
+      s) systemctl status --no-pager limit-tc-port.service || true; pause_enter ;;
+      b|0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
     esac
   done
 }
@@ -774,37 +799,38 @@ service_menu() {
 maintenance_menu() {
   local choice value
   while true; do
-    echo
-    echo "Maintenance Menu"
-    echo "[1] Apply enabled rules now"
-    echo "[2] Clear all tc rules"
-    echo "[3] Backup rules"
-    echo "[4] Restore rules from backup file"
-    echo "[5] Change interface"
-    echo "[6] Set IFB device"
-    echo "[7] Set link ceiling"
-    echo "[0] Back"
-    choice="$(prompt_input "Choice" "0")"
+    menu_header "Maintenance Toolkit"
+    echo "[A] Apply enabled rules now"
+    echo "[C] Clear all tc rules"
+    echo "[B] Backup rules"
+    echo "[R] Restore rules from backup"
+    echo "[N] Change interface"
+    echo "[I] Set IFB device"
+    echo "[L] Set link ceiling"
+    echo "[Q] Back"
+    choice="$(to_lower "$(prompt_input "Action")")"
     case "$choice" in
-      1) apply_enabled_rules ;;
-      2) clear_tc; print_ok "tc rules cleared." ;;
-      3) backup_rules ;;
-      4) restore_rules ;;
-      5) pick_interface ;;
-      6)
+      a) apply_enabled_rules; pause_enter ;;
+      c) clear_tc; print_ok "tc rules cleared."; pause_enter ;;
+      b) backup_rules; pause_enter ;;
+      r) restore_rules; pause_enter ;;
+      n) pick_interface; pause_enter ;;
+      i)
         value="$(prompt_input "IFB device name" "$IFB_DEV")"
         IFB_DEV="$value"
         save_config
         print_ok "IFB device set to $IFB_DEV"
+        pause_enter
         ;;
-      7)
+      l)
         value="$(prompt_input "Link ceiling (example: 1000mbit)" "$LINK_CEIL")"
         LINK_CEIL="$value"
         save_config
         print_ok "Link ceiling set to $LINK_CEIL"
+        pause_enter
         ;;
-      0) return ;;
-      *) echo "Invalid option." ;;
+      q|0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
     esac
   done
 }
@@ -812,37 +838,38 @@ maintenance_menu() {
 rules_menu() {
   local choice id
   while true; do
-    echo
-    echo "Rules Menu"
-    echo "[1] List rules"
-    echo "[2] Add rule"
-    echo "[3] Edit rule"
-    echo "[4] Enable rule"
-    echo "[5] Disable rule"
-    echo "[6] Delete rule"
-    echo "[7] Apply enabled rules"
-    echo "[8] Quick wizard"
-    echo "[0] Back"
-    choice="$(prompt_input "Choice" "0")"
+    menu_header "Rules Studio"
+    echo "[L] List rules"
+    echo "[A] Add rule"
+    echo "[E] Edit rule"
+    echo "[N] Enable rule"
+    echo "[F] Disable rule"
+    echo "[D] Delete rule"
+    echo "[P] Apply enabled rules"
+    echo "[W] Quick wizard"
+    echo "[B] Back"
+    choice="$(to_lower "$(prompt_input "Action" "b")")"
     case "$choice" in
-      1) list_rules ;;
-      2) add_rule ;;
-      3) edit_rule ;;
-      4)
+      l) list_rules; pause_enter ;;
+      a) add_rule; pause_enter ;;
+      e) edit_rule; pause_enter ;;
+      n)
         list_rules
         id="$(prompt_input "Rule ID to enable")"
         set_rule_enabled "$id" "1"
+        pause_enter
         ;;
-      5)
+      f)
         list_rules
         id="$(prompt_input "Rule ID to disable")"
         set_rule_enabled "$id" "0"
+        pause_enter
         ;;
-      6) delete_rule ;;
-      7) apply_enabled_rules ;;
-      8) quick_wizard ;;
-      0) return ;;
-      *) echo "Invalid option." ;;
+      d) delete_rule; pause_enter ;;
+      p) apply_enabled_rules; pause_enter ;;
+      w) quick_wizard; pause_enter ;;
+      b|0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
     esac
   done
 }
@@ -850,30 +877,32 @@ rules_menu() {
 detected_menu() {
   local choice
   while true; do
-    echo
+    menu_header "Inbound Discovery"
     print_detected_inbounds
     echo
-    echo "[1] Create rule from detected ports"
-    echo "[0] Back"
-    choice="$(prompt_input "Choice" "0")"
+    echo "[C] Create rule from detected ports"
+    echo "[B] Back"
+    choice="$(to_lower "$(prompt_input "Action" "b")")"
     case "$choice" in
-      1)
+      c)
         local default_ports
         default_ports="$(detected_ports_csv)"
         if [[ -z "$default_ports" ]]; then
           print_warn "No detected ports."
+          pause_enter
           continue
         fi
         add_rule "$default_ports" "both"
+        pause_enter
         ;;
-      0) return ;;
-      *) echo "Invalid option." ;;
+      b|0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
     esac
   done
 }
 
 render_dashboard() {
-  local selected_interface default_interface saved enabled disabled detected
+  local selected_interface default_interface saved enabled disabled detected ifb_state host_name up_text
   selected_interface="${INTERFACE:-N/A}"
   default_interface="$(detect_default_interface || true)"
   saved="$(count_saved_rules)"
@@ -881,18 +910,36 @@ render_dashboard() {
   disabled="$(count_disabled_rules)"
   detected="$(detected_ports_csv)"
   detected="${detected:-none}"
+  ifb_state="$(ifb_status)"
+  host_name="$(hostname 2>/dev/null || echo "server")"
+  up_text="$(uptime -p 2>/dev/null || echo "uptime n/a")"
+  if [[ "${#detected}" -gt 66 ]]; then
+    detected="${detected:0:63}..."
+  fi
 
-  echo -e "${CYAN}Selected Interface${RESET} : $selected_interface"
-  echo -e "${CYAN}Default Interface ${RESET} : ${default_interface:-N/A}"
-  echo -e "${CYAN}IFB Device        ${RESET} : $IFB_DEV"
-  echo -e "${CYAN}IFB Status        ${RESET} : $(ifb_status)"
-  echo -e "${CYAN}Saved Rules       ${RESET} : $saved"
-  echo -e "${CYAN}Enabled Rules     ${RESET} : $enabled"
-  echo -e "${CYAN}Disabled Rules    ${RESET} : $disabled"
-  echo -e "${CYAN}Detected Ports    ${RESET} : $detected"
-  echo -e "${CYAN}Rules File        ${RESET} : $RULES_DB"
-  echo -e "${CYAN}Log File          ${RESET} : $LOG_FILE"
-  echo "------------------------------------------------------------"
+  echo -e "${BLUE}======================================================================${RESET}"
+  echo -e " ${MAGENTA}BWLimiter Control Center${RESET}   ${DIM}host:${host_name}${RESET}"
+  echo -e "${BLUE}======================================================================${RESET}"
+  echo -e " ${CYAN}Network Snapshot${RESET}"
+  printf "   Interface      : %s\n" "$selected_interface"
+  printf "   Default Route  : %s\n" "${default_interface:-N/A}"
+  printf "   IFB Device     : %s\n" "$IFB_DEV"
+  printf "   IFB Status     : %b\n" "$(badge_state "$ifb_state")"
+  echo
+  echo -e " ${CYAN}Policy Snapshot${RESET}"
+  printf "   Saved Rules    : %s\n" "$saved"
+  printf "   Enabled Rules  : %b\n" "$(badge_state "enabled") ($enabled)"
+  printf "   Disabled Rules : %b\n" "$(badge_state "disabled") ($disabled)"
+  printf "   Detected Ports : %s\n" "$detected"
+  echo
+  echo -e " ${CYAN}Runtime${RESET}"
+  printf "   Uptime         : %s\n" "$up_text"
+  printf "   Rules DB       : %s\n" "$RULES_DB"
+  printf "   Log File       : %s\n" "$LOG_FILE"
+  echo -e "${BLUE}----------------------------------------------------------------------${RESET}"
+  echo " [R] Rules Studio   [I] Inbound Discovery   [S] Service Ops"
+  echo " [M] Live Monitor   [T] Maintenance Toolkit [W] Quick Wizard"
+  echo " [A] Apply Active   [Q] Quit"
 }
 
 show_help() {
@@ -916,21 +963,16 @@ main_menu() {
     clear
     render_dashboard
     echo
-    echo "Main Menu"
-    echo "[1] Rules"
-    echo "[2] Detected Inbounds"
-    echo "[3] Service"
-    echo "[4] Monitor"
-    echo "[5] Maintenance"
-    echo "[0] Exit"
-    choice="$(prompt_input "Choice" "0")"
+    choice="$(to_lower "$(prompt_input "Action" "q")")"
     case "$choice" in
-      1) rules_menu ;;
-      2) detected_menu ;;
-      3) service_menu ;;
-      4) monitor_tc_live ;;
-      5) maintenance_menu ;;
-      0) exit 0 ;;
+      r|1) rules_menu ;;
+      i|2) detected_menu ;;
+      s|3) service_menu ;;
+      m|4) monitor_tc_live ;;
+      t|5) maintenance_menu ;;
+      w) quick_wizard; pause_enter ;;
+      a) apply_enabled_rules; pause_enter ;;
+      q|0|exit) exit 0 ;;
       *) echo "Invalid option."; sleep 1 ;;
     esac
   done
