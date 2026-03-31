@@ -54,7 +54,7 @@ require_root() {
 require_commands() {
   local missing=()
   local cmd
-  for cmd in tc ip ss awk sort uniq paste systemctl modprobe; do
+  for cmd in tc ip ss awk sort uniq paste modprobe; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
@@ -63,6 +63,10 @@ require_commands() {
     print_err "Missing dependencies: ${missing[*]}"
     exit 1
   fi
+}
+
+has_systemd() {
+  command -v systemctl >/dev/null 2>&1
 }
 
 detect_default_interface() {
@@ -711,6 +715,10 @@ quick_wizard() {
 
 install_or_update_service() {
   local self_path
+  if ! has_systemd; then
+    print_err "systemctl not found. Service install is unavailable on this host."
+    return 1
+  fi
   self_path="$(readlink -f "$0")"
   install -m 0755 "$self_path" "$BIN_PATH"
 
@@ -737,6 +745,10 @@ EOF
 
 service_menu() {
   local choice
+  if ! has_systemd; then
+    print_err "systemctl not found. Service menu is unavailable."
+    return 1
+  fi
   while true; do
     echo
     echo "Service Menu"

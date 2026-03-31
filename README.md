@@ -18,6 +18,7 @@
 ## فایل‌ها
 
 - `limit-tc-port.sh`: اسکریپت اصلی
+- `bootstrap.sh`: نصب/آپدیت از GitHub + اجرای مستقیم منوی مدیریتی
 - `install.sh`: نصب سریع روی سرور
 - `systemd/limit-tc-port.service`: نمونه یونیت سرویس
 
@@ -41,6 +42,12 @@ apt install -y iproute2 iproute2-doc
 ```bash
 chmod +x limit-tc-port.sh install.sh
 sudo ./install.sh
+```
+
+نصب/آپدیت و اجرای منو با `curl` (تک‌خطی):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/B3hnamR/BWLimiter/main/bootstrap.sh | sudo bash
 ```
 
 یا نصب دستی:
@@ -86,4 +93,3 @@ sudo limit-tc-port --install-service
 
 - فیلتر پورت‌ها با `tc u32` برای `protocol ip` اعمال می‌شود (IPv4).  
   در صورت نیاز، می‌توان نسخه IPv6 را با `flower` یا مسیر mark-based اضافه کرد.
-
