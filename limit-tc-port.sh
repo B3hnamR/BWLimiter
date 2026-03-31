@@ -939,9 +939,9 @@ render_dashboard() {
   printf "   Rules DB       : %s\n" "$RULES_DB"
   printf "   Log File       : %s\n" "$LOG_FILE"
   echo -e "${BLUE}----------------------------------------------------------------------${RESET}"
-  echo " [R] Rules Studio   [I] Inbound Discovery   [S] Service Ops"
-  echo " [M] Live Monitor   [T] Maintenance Toolkit [W] Quick Wizard"
-  echo " [A] Apply Active   [Q] Quit"
+  echo " [1] Rules Studio   [2] Inbound Discovery   [3] Service Ops"
+  echo " [4] Live Monitor   [5] Maintenance Toolkit [6] Quick Wizard"
+  echo " [7] Apply Active   [0] Quit"
 }
 
 show_help() {
@@ -966,15 +966,15 @@ main_menu() {
     clear
     render_dashboard
     echo
-    choice="$(to_lower "$(prompt_input "Action" "q")")"
+    choice="$(to_lower "$(prompt_input "Choice" "0")")"
     case "$choice" in
       r|1) rules_menu ;;
       i|2) detected_menu ;;
       s|3) service_menu ;;
       m|4) monitor_tc_live ;;
       t|5) maintenance_menu ;;
-      w) quick_wizard; pause_enter ;;
-      a) apply_enabled_rules; pause_enter ;;
+      w|6) quick_wizard; pause_enter ;;
+      a|7) apply_enabled_rules; pause_enter ;;
       q|0|exit) exit 0 ;;
       *) echo "Invalid option."; sleep 1 ;;
     esac
