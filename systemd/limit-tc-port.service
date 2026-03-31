@@ -1,0 +1,14 @@
+[Unit]
+Description=Port bandwidth limiter using tc/ifb
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/limit-tc-port --apply
+ExecStop=/usr/local/bin/limit-tc-port --clear
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+
