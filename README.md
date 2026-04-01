@@ -240,4 +240,12 @@ What to verify first:
 
 ---
 
+## 14) Acknowledgment and Attribution
+
+The idea and general concept behind this project were inspired by the Telegram channel **KillNationChannel**. However, the actual implementation, structure, and source code in this repository were independently written and developed by me.
+
+It should also be noted that **KillNationChannel** already provides a script with similar functionality, and users are welcome to use their version directly if they prefer.
+
+---
+
 Developed by: Behnam (`@b3hnamrjd`)
