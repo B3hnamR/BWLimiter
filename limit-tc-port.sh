@@ -780,7 +780,7 @@ generate_debug_report() {
     echo "ifb-status: $(ifb_status)"
     echo "link-ceil: ${LINK_CEIL}"
     echo
-    echo "=== detected inbounds (${detected_source_label}) ==="
+    echo "=== detected inbounds ($(detected_source_label)) ==="
     detect_inbounds || true
     echo
     echo "=== rules db ==="
