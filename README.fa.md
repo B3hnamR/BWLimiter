@@ -8,11 +8,15 @@
 - جدا کردن محدودیت Upload و Download
 - پشتیبانی از `tcp`، `udp` یا هر دو
 - تعریف یک Rule برای چند پورت هم‌زمان
-- شناسایی خودکار پورت‌های listening
+- شناسایی خودکار inboundها با اولویت پردازش‌های VPN (`xray`، `x-ui`، `sing-box`، `v2ray`)
+- پشتیبانی از parse مستقیم دیتابیس/کانفیگ `MHSanaei/3x-ui` (در صورت موجود بودن)
 - مدیریت کامل Rule: ساخت، ویرایش، فعال/غیرفعال، حذف
 - اعمال خودکار Ruleها بعد از ریبوت (با systemd)
 - مانیتور لحظه‌ای وضعیت `tc`
+- خروجی Debug Report برای عیب‌یابی سریع
 - ویزارد سریع برای راه‌اندازی اولیه
+
+برای شناسایی عمیق inboundها بهتر است `sqlite3` و `jq` هم روی سیستم نصب باشد (اختیاری).
 
 ## نکته مهم قبل از استفاده
 
@@ -69,7 +73,10 @@ sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
 sudo limit-tc-port --install-service
+sudo limit-tc-port --debug-report
 ```
+
+در منوی Maintenance هم گزینه `[8]` برای تولید گزارش عیب‌یابی اضافه شده و فایل را داخل `/tmp` ذخیره می‌کند.
 
 ## مسیر فایل‌ها
 

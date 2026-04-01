@@ -77,6 +77,10 @@ detect_default_interface() {
   ip route show default 2>/dev/null | awk '/default/ {print $5; exit}'
 }
 
+has_command() {
+  command -v "$1" >/dev/null 2>&1
+}
+
 ensure_storage() {
   mkdir -p "$CONFIG_DIR"
   touch "$LOG_FILE"
@@ -187,7 +191,31 @@ proto_words() {
 }
 
 detect_inbounds() {
-  ss -H -lntu 2>/dev/null | awk '
+  local ports vpn_detected
+
+  ports="$(detect_ports_from_3xui_db)"
+  if [[ -n "$ports" ]]; then
+    echo "$ports" | ports_to_inbounds
+    return
+  fi
+
+  ports="$(detect_ports_from_xray_config)"
+  if [[ -n "$ports" ]]; then
+    echo "$ports" | ports_to_inbounds
+    return
+  fi
+
+  vpn_detected="$(detect_inbounds_vpn_processes)"
+  if [[ -n "$vpn_detected" ]]; then
+    echo "$vpn_detected"
+    return
+  fi
+
+  detect_inbounds_all
+}
+
+ss_lines_to_inbounds() {
+  awk '
   {
     proto=$1
     addr=$5
@@ -213,13 +241,144 @@ detect_inbounds() {
   }' | sort -n -t'|' -k1,1
 }
 
+detect_inbounds_all() {
+  ss -H -lntu 2>/dev/null | ss_lines_to_inbounds
+}
+
+discover_3xui_db_paths() {
+  cat <<'EOF'
+/etc/x-ui/x-ui.db
+/etc/3x-ui/x-ui.db
+/usr/local/x-ui/x-ui.db
+/usr/local/etc/x-ui/x-ui.db
+/opt/x-ui/x-ui.db
+/var/lib/x-ui/x-ui.db
+EOF
+}
+
+discover_xray_config_paths() {
+  cat <<'EOF'
+/usr/local/etc/xray/config.json
+/etc/xray/config.json
+/usr/local/xray/config.json
+/opt/xray/config.json
+/etc/3x-ui/xray/config.json
+/usr/local/x-ui/bin/config.json
+EOF
+}
+
+read_enabled_ports_from_3xui_db() {
+  local db_path="$1"
+  local has_inbounds has_enable
+  [[ -f "$db_path" ]] || return 0
+  has_command sqlite3 || return 0
+
+  has_inbounds="$(sqlite3 -readonly "$db_path" "SELECT 1 FROM sqlite_master WHERE type='table' AND name='inbounds' LIMIT 1;" 2>/dev/null || true)"
+  [[ "$has_inbounds" == "1" ]] || return 0
+
+  has_enable="$(sqlite3 -readonly "$db_path" "SELECT 1 FROM pragma_table_info('inbounds') WHERE name='enable' LIMIT 1;" 2>/dev/null || true)"
+
+  if [[ "$has_enable" == "1" ]]; then
+    sqlite3 -readonly "$db_path" "SELECT port FROM inbounds WHERE enable = 1;" 2>/dev/null || true
+  else
+    sqlite3 -readonly "$db_path" "SELECT port FROM inbounds;" 2>/dev/null || true
+  fi
+}
+
+detect_ports_from_3xui_db() {
+  local path
+  while IFS= read -r path; do
+    [[ -f "$path" ]] || continue
+    read_enabled_ports_from_3xui_db "$path"
+  done < <(discover_3xui_db_paths) \
+    | awk '($0 ~ /^[0-9]+$/ && $0>=1 && $0<=65535){print $0}' \
+    | sort -n \
+    | uniq
+}
+
+read_ports_from_xray_config_jq() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 0
+  has_command jq || return 0
+  jq -r '.inbounds[]? | .port // empty' "$cfg" 2>/dev/null || true
+}
+
+read_ports_from_xray_config_grep() {
+  local cfg="$1"
+  [[ -f "$cfg" ]] || return 0
+  grep -oE '"port"[[:space:]]*:[[:space:]]*[0-9]+' "$cfg" 2>/dev/null \
+    | grep -oE '[0-9]+' \
+    || true
+}
+
+detect_ports_from_xray_config() {
+  local path
+  while IFS= read -r path; do
+    [[ -f "$path" ]] || continue
+    if has_command jq; then
+      read_ports_from_xray_config_jq "$path"
+    else
+      read_ports_from_xray_config_grep "$path"
+    fi
+  done < <(discover_xray_config_paths) \
+    | awk '($0 ~ /^[0-9]+$/ && $0>=1 && $0<=65535){print $0}' \
+    | sort -n \
+    | uniq
+}
+
+ports_to_inbounds() {
+  local ss_map_file
+  ss_map_file="$(mktemp)"
+  detect_inbounds_all >"$ss_map_file"
+
+  awk -F'|' '
+    NR==FNR {
+      if ($1 ~ /^[0-9]+$/ && $2 != "") proto[$1]=$2;
+      next
+    }
+    $1 ~ /^[0-9]+$/ {
+      p=$1
+      pr=(p in proto)?proto[p]:"both"
+      print p "|" pr
+    }
+  ' "$ss_map_file" - | sort -n -t'|' -k1,1 | uniq
+
+  rm -f "$ss_map_file"
+}
+
+detect_inbounds_vpn_processes() {
+  ss -H -lntup 2>/dev/null \
+    | awk 'tolower($0) ~ /(xray|v2ray|sing-box|x-ui|3x-ui)/ {print}' \
+    | ss_lines_to_inbounds
+}
+
+detected_source_label() {
+  if [[ -n "$(detect_ports_from_3xui_db)" ]]; then
+    echo "3xui-db"
+    return
+  fi
+  if [[ -n "$(detect_ports_from_xray_config)" ]]; then
+    echo "xray-config"
+    return
+  fi
+  if [[ -n "$(detect_inbounds_vpn_processes)" ]]; then
+    echo "vpn-processes"
+    return
+  fi
+  if [[ -n "$(detect_inbounds_all)" ]]; then
+    echo "all-listeners"
+    return
+  fi
+  echo "none"
+}
+
 detected_ports_csv() {
   detect_inbounds | cut -d'|' -f1 | paste -sd, -
 }
 
 print_detected_inbounds() {
   local found=0
-  echo "Detected listening ports:"
+  echo "Detected inbound ports (source: $(detected_source_label)):"
   while IFS='|' read -r port proto; do
     found=1
     printf "  - %-6s %s\n" "$port" "$proto"
@@ -606,6 +765,59 @@ show_tc_status() {
   tc -s class show dev "$IFB_DEV" 2>/dev/null || true
 }
 
+generate_debug_report() {
+  local report_file
+  report_file="/tmp/limit-tc-port-debug-$(date +%Y%m%d-%H%M%S).log"
+
+  {
+    echo "=== limit-tc-port debug report ==="
+    echo "time: $(ts)"
+    echo
+    echo "=== config ==="
+    echo "interface: ${INTERFACE:-N/A}"
+    echo "default-interface: $(detect_default_interface || echo N/A)"
+    echo "ifb: ${IFB_DEV}"
+    echo "ifb-status: $(ifb_status)"
+    echo "link-ceil: ${LINK_CEIL}"
+    echo
+    echo "=== detected inbounds (${detected_source_label}) ==="
+    detect_inbounds || true
+    echo
+    echo "=== rules db ==="
+    cat "$RULES_DB" 2>/dev/null || true
+    echo
+    echo "=== tc qdisc (main) ==="
+    tc qdisc show dev "$INTERFACE" 2>/dev/null || true
+    echo
+    echo "=== tc class (main) ==="
+    tc -s class show dev "$INTERFACE" 2>/dev/null || true
+    echo
+    echo "=== tc filter (main root 1:) ==="
+    tc filter show dev "$INTERFACE" parent 1: 2>/dev/null || true
+    echo
+    echo "=== tc qdisc (ifb) ==="
+    tc qdisc show dev "$IFB_DEV" 2>/dev/null || true
+    echo
+    echo "=== tc class (ifb) ==="
+    tc -s class show dev "$IFB_DEV" 2>/dev/null || true
+    echo
+    echo "=== tc filter (ifb root 2:) ==="
+    tc filter show dev "$IFB_DEV" parent 2: 2>/dev/null || true
+    echo
+    echo "=== listening sockets ==="
+    ss -lntup 2>/dev/null || true
+    echo
+    if has_systemd; then
+      echo "=== service status ==="
+      systemctl status --no-pager limit-tc-port.service 2>/dev/null || true
+      echo
+    fi
+    echo "=== end of report ==="
+  } >"$report_file"
+
+  print_ok "Debug report created: $report_file"
+}
+
 monitor_tc_live() {
   if command -v watch >/dev/null 2>&1; then
     watch -n 1 "echo 'Upload classes on $INTERFACE'; tc -s class show dev $INTERFACE 2>/dev/null; echo; echo 'Download classes on $IFB_DEV'; tc -s class show dev $IFB_DEV 2>/dev/null"
@@ -810,6 +1022,7 @@ maintenance_menu() {
     echo "[5] Change interface"
     echo "[6] Set IFB device"
     echo "[7] Set link ceiling"
+    echo "[8] Generate debug report"
     echo "[0] Back"
     choice="$(prompt_input "Choice")"
     case "$choice" in
@@ -830,6 +1043,10 @@ maintenance_menu() {
         LINK_CEIL="$value"
         save_config
         print_ok "Link ceiling set to $LINK_CEIL"
+        pause_enter
+        ;;
+      8)
+        generate_debug_report
         pause_enter
         ;;
       0) return ;;
@@ -905,13 +1122,14 @@ detected_menu() {
 }
 
 render_dashboard() {
-  local selected_interface default_interface saved enabled disabled detected ifb_state host_name up_text
+  local selected_interface default_interface saved enabled disabled detected detected_source ifb_state host_name up_text
   selected_interface="${INTERFACE:-N/A}"
   default_interface="$(detect_default_interface || true)"
   saved="$(count_saved_rules)"
   enabled="$(count_enabled_rules)"
   disabled="$(count_disabled_rules)"
   detected="$(detected_ports_csv)"
+  detected_source="$(detected_source_label)"
   detected="${detected:-none}"
   ifb_state="$(ifb_status)"
   host_name="$(hostname 2>/dev/null || echo "server")"
@@ -935,6 +1153,7 @@ render_dashboard() {
   printf "   Enabled Rules  : %b\n" "$(badge_state "enabled") ($enabled)"
   printf "   Disabled Rules : %b\n" "$(badge_state "disabled") ($disabled)"
   printf "   Detected Ports : %s\n" "$detected"
+  printf "   Detected Source: %s\n" "$detected_source"
   echo
   echo -e " ${CYAN}Runtime${RESET}"
   printf "   Uptime         : %s\n" "$up_text"
@@ -958,6 +1177,7 @@ Usage:
   $APP_NAME --status         # show tc status
   $APP_NAME --list           # list saved rules
   $APP_NAME --install-service
+  $APP_NAME --debug-report   # generate debug report in /tmp
   $APP_NAME --help
 EOF
 }
@@ -1021,6 +1241,12 @@ main() {
       require_root
       require_commands
       install_or_update_service
+      exit 0
+      ;;
+    --debug-report)
+      require_root
+      require_commands
+      generate_debug_report
       exit 0
       ;;
     "")

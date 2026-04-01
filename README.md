@@ -14,11 +14,13 @@ BWLimiter helps you control upload/download speed per port, manage rules from an
 - Independent Upload and Download control
 - Protocol support: `tcp`, `udp`, or `both`
 - Multi-port rules in one entry
-- Auto-detection of listening inbound ports
+- Auto-detection of inbounds with VPN-process priority (`xray`, `x-ui`, `sing-box`, `v2ray`)
+- Direct parse support for `MHSanaei/3x-ui` DB/config (when available)
 - Rule lifecycle management: create, edit, enable/disable, delete
 - Speed changes without deleting existing rules
 - Persistent restore after reboot via `systemd`
 - Live `tc` monitor
+- One-click debug report generator
 - Quick wizard for fast setup
 
 ## How It Works
@@ -34,6 +36,7 @@ BWLimiter helps you control upload/download speed per port, manage rules from an
 - `iproute2` (`tc`, `ip`, `ss`)
 - `kmod` (`modprobe`)
 - `systemd` (optional, for auto-apply at boot)
+- Optional for deep inbound detection: `sqlite3`, `jq`
 
 ## Quick Install (curl)
 
@@ -76,6 +79,10 @@ Main menu shortcuts:
 - `[7]` Apply Active
 - `[0]` Quit
 
+Maintenance menu:
+
+- `[8]` Generate debug report (`/tmp/limit-tc-port-debug-*.log`)
+
 CLI commands:
 
 ```bash
@@ -84,6 +91,7 @@ sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
 sudo limit-tc-port --install-service
+sudo limit-tc-port --debug-report
 sudo limit-tc-port --help
 ```
 
