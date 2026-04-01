@@ -18,6 +18,7 @@ BWLimiter helps you control upload/download speed per port, manage rules from an
 - Direct parse support for `MHSanaei/3x-ui` DB/config (when available)
 - Rule lifecycle management: create, edit, enable/disable, delete
 - Speed changes without deleting existing rules
+- Advanced time scheduling (multiple windows per rule, day filters, priority)
 - Persistent restore after reboot via `systemd`
 - Live `tc` monitor
 - One-click debug report generator
@@ -48,7 +49,7 @@ What this does:
 
 - Detects package manager and installs missing dependencies
 - Downloads/updates `limit-tc-port` in `/usr/local/bin/limit-tc-port`
-- Installs/enables systemd service when available
+- Installs/enables systemd service + scheduler timer when available
 - Launches the interactive menu
 
 ## Manual Install
@@ -77,19 +78,30 @@ Main menu shortcuts:
 - `[5]` Maintenance Toolkit
 - `[6]` Quick Wizard
 - `[7]` Apply Active
+- `[8]` Time Schedules
 - `[0]` Quit
 
 Maintenance menu:
 
 - `[8]` Generate debug report (`/tmp/limit-tc-port-debug-*.log`)
 
+Time Schedules menu:
+
+- Add unlimited schedule windows per rule
+- Day selectors: `all`, `weekday`, `weekend`, or `mon,tue,...`
+- Time windows with overnight support (example `23:00` -> `06:00`)
+- Priority handling for overlapping windows (higher priority wins)
+- Live preview of effective limits
+
 CLI commands:
 
 ```bash
 sudo limit-tc-port --apply
+sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
+sudo limit-tc-port --list-schedules
 sudo limit-tc-port --install-service
 sudo limit-tc-port --debug-report
 sudo limit-tc-port --help
@@ -100,17 +112,21 @@ sudo limit-tc-port --help
 ```bash
 sudo systemctl enable --now limit-tc-port.service
 sudo systemctl status limit-tc-port.service
+sudo systemctl enable --now limit-tc-port-scheduler.timer
+sudo systemctl status limit-tc-port-scheduler.timer
 ```
 
 The service executes:
 
 - Start: `limit-tc-port --apply`
 - Stop: `limit-tc-port --clear`
+- Scheduler tick (every minute): `limit-tc-port --tick`
 
 ## Storage Paths
 
 - Config: `/etc/limit-tc-port/config`
 - Rules DB: `/etc/limit-tc-port/rules.db`
+- Schedules DB: `/etc/limit-tc-port/schedules.db`
 - Log: `/var/log/limit-tc-port.log`
 
 ## Production Notes

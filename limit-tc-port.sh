@@ -7,9 +7,14 @@ APP_AUTHOR="Behnam (@b3hnamrjd)"
 CONFIG_DIR="/etc/limit-tc-port"
 CONFIG_FILE="$CONFIG_DIR/config"
 RULES_DB="$CONFIG_DIR/rules.db"
+SCHEDULES_DB="$CONFIG_DIR/schedules.db"
 LOG_FILE="/var/log/limit-tc-port.log"
 SERVICE_FILE="/etc/systemd/system/limit-tc-port.service"
+SCHEDULER_SERVICE_FILE="/etc/systemd/system/limit-tc-port-scheduler.service"
+SCHEDULER_TIMER_FILE="/etc/systemd/system/limit-tc-port-scheduler.timer"
 BIN_PATH="/usr/local/bin/limit-tc-port"
+STATE_DIR="/run/limit-tc-port"
+SCHEDULE_HASH_FILE="$STATE_DIR/schedule.hash"
 
 INTERFACE=""
 IFB_DEV="ifb0"
@@ -58,7 +63,7 @@ require_root() {
 require_commands() {
   local missing=()
   local cmd
-  for cmd in tc ip ss awk sort uniq paste modprobe; do
+  for cmd in tc ip ss awk sort uniq paste modprobe cksum; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
       missing+=("$cmd")
     fi
@@ -83,10 +88,16 @@ has_command() {
 
 ensure_storage() {
   mkdir -p "$CONFIG_DIR"
+  mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
   touch "$LOG_FILE"
   if [[ ! -f "$RULES_DB" ]]; then
     cat >"$RULES_DB" <<'EOF'
 # id|enabled|name|ports|proto|down_kbit|up_kbit|burst_kb|created_at|updated_at
+EOF
+  fi
+  if [[ ! -f "$SCHEDULES_DB" ]]; then
+    cat >"$SCHEDULES_DB" <<'EOF'
+# sid|rule_id|enabled|label|days|start_hhmm|end_hhmm|down_kbit|up_kbit|burst_kb|priority|created_at|updated_at
 EOF
   fi
 }
@@ -139,6 +150,18 @@ count_disabled_rules() {
   echo $((total - enabled))
 }
 
+schedules_lines() {
+  grep -Ev '^[[:space:]]*#|^[[:space:]]*$' "$SCHEDULES_DB" || true
+}
+
+count_saved_schedules() {
+  schedules_lines | wc -l | awk '{print $1}'
+}
+
+count_enabled_schedules() {
+  schedules_lines | awk -F'|' '$3=="1"{c++} END{print c+0}'
+}
+
 ifb_status() {
   if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
     echo "MISSING"
@@ -188,6 +211,389 @@ proto_words() {
     both) echo "tcp udp" ;;
     *) return 1 ;;
   esac
+}
+
+sanitize_label() {
+  echo "${1:-}" | tr '|' '/' | tr -d '\r'
+}
+
+validate_hhmm() {
+  [[ "${1:-}" =~ ^([01][0-9]|2[0-3]):[0-5][0-9]$ ]]
+}
+
+hhmm_to_minutes() {
+  local hh mm
+  hh="${1%%:*}"
+  mm="${1##*:}"
+  echo $((10#$hh * 60 + 10#$mm))
+}
+
+day_name_from_num() {
+  case "$1" in
+    1) echo "mon" ;;
+    2) echo "tue" ;;
+    3) echo "wed" ;;
+    4) echo "thu" ;;
+    5) echo "fri" ;;
+    6) echo "sat" ;;
+    7) echo "sun" ;;
+    *) echo "" ;;
+  esac
+}
+
+normalize_days() {
+  local raw token
+  local normalized=""
+  local -a _days
+  raw="$(to_lower "$(echo "${1:-}" | tr -d '[:space:]')")"
+  [[ -z "$raw" ]] && return 1
+
+  case "$raw" in
+    all|weekday|weekend)
+      echo "$raw"
+      return 0
+      ;;
+  esac
+
+  IFS=',' read -r -a _days <<<"$raw"
+  for token in "${_days[@]}"; do
+    case "$token" in
+      mon|tue|wed|thu|fri|sat|sun)
+        if [[ ",$normalized," != *",$token,"* ]]; then
+          normalized="${normalized:+$normalized,}$token"
+        fi
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+
+  [[ -n "$normalized" ]] || return 1
+
+  local ordered="" d
+  for d in mon tue wed thu fri sat sun; do
+    if [[ ",$normalized," == *",$d,"* ]]; then
+      ordered="${ordered:+$ordered,}$d"
+    fi
+  done
+
+  echo "$ordered"
+}
+
+schedule_day_matches() {
+  local days="$1"
+  local now_num now_day
+  now_num="$(date +%u)"
+
+  case "$days" in
+    all) return 0 ;;
+    weekday) (( now_num >= 1 && now_num <= 5 )); return $? ;;
+    weekend) (( now_num == 6 || now_num == 7 )); return $? ;;
+  esac
+
+  now_day="$(day_name_from_num "$now_num")"
+  [[ ",$days," == *",$now_day,"* ]]
+}
+
+schedule_time_matches() {
+  local start="$1" end="$2" now
+  local start_m end_m now_m
+  now="$(date +%H:%M)"
+
+  validate_hhmm "$start" || return 1
+  validate_hhmm "$end" || return 1
+  validate_hhmm "$now" || return 1
+
+  start_m="$(hhmm_to_minutes "$start")"
+  end_m="$(hhmm_to_minutes "$end")"
+  now_m="$(hhmm_to_minutes "$now")"
+
+  if (( start_m == end_m )); then
+    return 0
+  fi
+  if (( start_m < end_m )); then
+    (( now_m >= start_m && now_m < end_m ))
+    return $?
+  fi
+
+  (( now_m >= start_m || now_m < end_m ))
+}
+
+schedule_is_active_now() {
+  local days="$1" start="$2" end="$3"
+  schedule_day_matches "$days" || return 1
+  schedule_time_matches "$start" "$end" || return 1
+  return 0
+}
+
+next_schedule_id() {
+  local max_id
+  max_id="$(schedules_lines | awk -F'|' 'BEGIN{m=0} {if($1+0>m)m=$1+0} END{print m+0}')"
+  echo $((max_id + 1))
+}
+
+get_schedule_by_id() {
+  local sid="$1"
+  schedules_lines | awk -F'|' -v x="$sid" '$1==x{print; exit}'
+}
+
+replace_schedule_line() {
+  local sid="$1" new_line="$2" tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v x="$sid" -v nl="$new_line" '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next}
+  $1==x {print nl; found=1; next}
+  {print}
+  END {if(found!=1) exit 1}
+  ' "$SCHEDULES_DB" >"$tmp_file" && mv "$tmp_file" "$SCHEDULES_DB"
+}
+
+delete_schedule_line() {
+  local sid="$1" tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v x="$sid" '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next}
+  $1==x {found=1; next}
+  {print}
+  END {if(found!=1) exit 1}
+  ' "$SCHEDULES_DB" >"$tmp_file" && mv "$tmp_file" "$SCHEDULES_DB"
+}
+
+active_schedule_for_rule() {
+  local rule_id="$1"
+  local best_prio=-2147483647
+  local best_sid=0
+  local best_line=""
+  local sid rid enabled label days start end down up burst priority created updated
+
+  while IFS='|' read -r sid rid enabled label days start end down up burst priority created updated; do
+    [[ "$rid" == "$rule_id" ]] || continue
+    [[ "$enabled" == "1" ]] || continue
+    schedule_is_active_now "$days" "$start" "$end" || continue
+    is_non_negative_int "$priority" || priority=100
+    is_non_negative_int "$sid" || sid=0
+
+    if (( priority > best_prio || (priority == best_prio && sid > best_sid) )); then
+      best_prio="$priority"
+      best_sid="$sid"
+      best_line="$sid|$rid|$enabled|$label|$days|$start|$end|$down|$up|$burst|$priority|$created|$updated"
+    fi
+  done < <(schedules_lines)
+
+  [[ -n "$best_line" ]] && echo "$best_line"
+}
+
+resolve_effective_limits() {
+  local rule_id="$1" base_down="$2" base_up="$3" base_burst="$4"
+  local eff_down="$base_down" eff_up="$base_up" eff_burst="$base_burst"
+  local sched sid rid enabled label days start end down up burst priority created updated
+
+  sched="$(active_schedule_for_rule "$rule_id")"
+  if [[ -n "$sched" ]]; then
+    IFS='|' read -r sid rid enabled label days start end down up burst priority created updated <<<"$sched"
+    is_non_negative_int "$down" && eff_down="$down"
+    is_non_negative_int "$up" && eff_up="$up"
+    is_non_negative_int "$burst" && eff_burst="$burst"
+    if [[ "$eff_burst" -eq 0 ]]; then
+      eff_burst=32
+    fi
+    echo "$eff_down|$eff_up|$eff_burst|schedule|$sid|$label"
+    return
+  fi
+
+  if [[ "$eff_burst" -eq 0 ]]; then
+    eff_burst=32
+  fi
+  echo "$eff_down|$eff_up|$eff_burst|rule|-|-"
+}
+
+count_active_schedules_now() {
+  local c=0
+  local sid rid enabled label days start end down up burst priority created updated
+  while IFS='|' read -r sid rid enabled label days start end down up burst priority created updated; do
+    [[ "$enabled" == "1" ]] || continue
+    if schedule_is_active_now "$days" "$start" "$end"; then
+      ((c++))
+    fi
+  done < <(schedules_lines)
+  echo "$c"
+}
+
+list_schedules() {
+  local count
+  count="$(count_saved_schedules)"
+  if [[ "$count" -eq 0 ]]; then
+    echo "No schedule windows."
+    return
+  fi
+
+  printf "%-4s %-5s %-7s %-14s %-16s %-5s %-5s %-7s %-8s %-18s\n" \
+    "SID" "Rule" "State" "When" "Days" "Down" "Up" "Burst" "Prio" "Label"
+  printf "%-4s %-5s %-7s %-14s %-16s %-5s %-5s %-7s %-8s %-18s\n" \
+    "----" "-----" "-------" "--------------" "----------------" "-----" "-----" "-------" "--------" "------------------"
+
+  local sid rid enabled label days start end down up burst priority created updated status
+  while IFS='|' read -r sid rid enabled label days start end down up burst priority created updated; do
+    status="OFF"
+    [[ "$enabled" == "1" ]] && status="ON"
+    printf "%-4s %-5s %-7s %-14s %-16s %-5s %-5s %-7s %-8s %-18s\n" \
+      "$sid" "$rid" "$status" "$start-$end" "$days" "$down" "$up" "$burst" "$priority" "$label"
+  done < <(schedules_lines)
+}
+
+preview_effective_limits_now() {
+  local count
+  count="$(count_saved_rules)"
+  if [[ "$count" -eq 0 ]]; then
+    echo "No saved rules."
+    return
+  fi
+
+  printf "%-4s %-18s %-7s %-8s %-8s %-8s %-10s %-8s %-16s\n" \
+    "ID" "Name" "Ports" "BaseD" "BaseU" "EffD" "EffU" "Source" "Schedule"
+  printf "%-4s %-18s %-7s %-8s %-8s %-8s %-10s %-8s %-16s\n" \
+    "----" "------------------" "-------" "--------" "--------" "--------" "----------" "--------" "----------------"
+
+  local id enabled name ports proto down up burst created updated
+  local resolved eff_down eff_up eff_burst source sid label
+  while IFS='|' read -r id enabled name ports proto down up burst created updated; do
+    [[ "$enabled" == "1" ]] || continue
+    resolved="$(resolve_effective_limits "$id" "$down" "$up" "$burst")"
+    IFS='|' read -r eff_down eff_up eff_burst source sid label <<<"$resolved"
+    printf "%-4s %-18s %-7s %-8s %-8s %-8s %-10s %-8s %-16s\n" \
+      "$id" "$name" "$ports" "$down" "$up" "$eff_down" "$eff_up" "$source" "${label:--}"
+  done < <(rules_lines)
+}
+
+add_schedule() {
+  local sid rid enabled label days start end down up burst priority now line
+  local rule_line
+
+  list_rules
+  echo
+  rid="$(prompt_input "Rule ID for this schedule")"
+  rule_line="$(get_rule_by_id "$rid")"
+  if [[ -z "$rule_line" ]]; then
+    print_err "Rule not found."
+    return 1
+  fi
+
+  sid="$(next_schedule_id)"
+  label="$(sanitize_label "$(prompt_input "Schedule label" "window-$sid")")"
+
+  while true; do
+    days="$(normalize_days "$(prompt_input "Days (all|weekday|weekend|mon,tue,...)" "all")" || true)"
+    [[ -n "$days" ]] && break
+    echo "Invalid days format."
+  done
+
+  while true; do
+    start="$(prompt_input "Start time (HH:MM)" "08:00")"
+    if validate_hhmm "$start"; then break; fi
+    echo "Invalid time format."
+  done
+  while true; do
+    end="$(prompt_input "End time (HH:MM)" "18:00")"
+    if validate_hhmm "$end"; then break; fi
+    echo "Invalid time format."
+  done
+
+  down="$(prompt_non_negative_int "Scheduled download limit (kbit, 0=off)" "0")"
+  up="$(prompt_non_negative_int "Scheduled upload limit (kbit, 0=off)" "0")"
+  burst="$(prompt_non_negative_int "Scheduled burst (kb)" "32")"
+  [[ "$burst" -eq 0 ]] && burst=32
+  priority="$(prompt_non_negative_int "Priority (higher wins)" "100")"
+
+  if prompt_yes_no "Enable this schedule now?" "y"; then
+    enabled=1
+  else
+    enabled=0
+  fi
+
+  now="$(ts)"
+  line="$sid|$rid|$enabled|$label|$days|$start|$end|$down|$up|$burst|$priority|$now|$now"
+  echo "$line" >>"$SCHEDULES_DB"
+  print_ok "Schedule $sid created for rule $rid."
+  print_warn "Enable scheduler timer in Service menu for automatic time-based switching."
+}
+
+edit_schedule() {
+  local sid line rid enabled label days start end down up burst priority created updated now
+  list_schedules
+  echo
+  sid="$(prompt_input "Schedule SID to edit")"
+  line="$(get_schedule_by_id "$sid")"
+  if [[ -z "$line" ]]; then
+    print_err "Schedule not found."
+    return 1
+  fi
+  IFS='|' read -r sid rid enabled label days start end down up burst priority created updated <<<"$line"
+
+  label="$(sanitize_label "$(prompt_input "Schedule label" "$label")")"
+  while true; do
+    days="$(normalize_days "$(prompt_input "Days (all|weekday|weekend|mon,tue,...)" "$days")" || true)"
+    [[ -n "$days" ]] && break
+    echo "Invalid days format."
+  done
+  while true; do
+    start="$(prompt_input "Start time (HH:MM)" "$start")"
+    validate_hhmm "$start" && break
+    echo "Invalid time format."
+  done
+  while true; do
+    end="$(prompt_input "End time (HH:MM)" "$end")"
+    validate_hhmm "$end" && break
+    echo "Invalid time format."
+  done
+
+  down="$(prompt_non_negative_int "Scheduled download limit (kbit, 0=off)" "$down")"
+  up="$(prompt_non_negative_int "Scheduled upload limit (kbit, 0=off)" "$up")"
+  burst="$(prompt_non_negative_int "Scheduled burst (kb)" "$burst")"
+  [[ "$burst" -eq 0 ]] && burst=32
+  priority="$(prompt_non_negative_int "Priority (higher wins)" "$priority")"
+
+  now="$(ts)"
+  replace_schedule_line "$sid" "$sid|$rid|$enabled|$label|$days|$start|$end|$down|$up|$burst|$priority|$created|$now" || {
+    print_err "Failed to edit schedule."
+    return 1
+  }
+  print_ok "Schedule $sid updated."
+}
+
+set_schedule_enabled() {
+  local sid="$1" target="$2" line rid enabled label days start end down up burst priority created updated
+  line="$(get_schedule_by_id "$sid")"
+  if [[ -z "$line" ]]; then
+    print_err "Schedule not found."
+    return 1
+  fi
+  IFS='|' read -r sid rid enabled label days start end down up burst priority created updated <<<"$line"
+  replace_schedule_line "$sid" "$sid|$rid|$target|$label|$days|$start|$end|$down|$up|$burst|$priority|$created|$(ts)" || {
+    print_err "Failed to update schedule state."
+    return 1
+  }
+  if [[ "$target" == "1" ]]; then
+    print_ok "Schedule $sid enabled."
+  else
+    print_ok "Schedule $sid disabled."
+  fi
+}
+
+delete_schedule() {
+  local sid
+  list_schedules
+  echo
+  sid="$(prompt_input "Schedule SID to delete")"
+  if ! prompt_yes_no "Delete schedule $sid ?" "n"; then
+    echo "Cancelled."
+    return 0
+  fi
+  delete_schedule_line "$sid" || {
+    print_err "Schedule not found."
+    return 1
+  }
+  print_ok "Schedule $sid deleted."
 }
 
 detect_inbounds() {
@@ -647,6 +1053,7 @@ clear_tc() {
   tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
   tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
   tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
+  rm -f "$SCHEDULE_HASH_FILE" >/dev/null 2>&1 || true
 }
 
 add_port_filter() {
@@ -669,6 +1076,58 @@ add_port_filter() {
     match ip protocol "$proto_num" 0xff \
     match ip "$field" "$port" 0xffff \
     flowid "$classid" >/dev/null 2>&1
+}
+
+build_effective_signature() {
+  {
+    echo "interface=${INTERFACE}"
+    echo "ifb=${IFB_DEV}"
+    echo "link_ceil=${LINK_CEIL}"
+    local id enabled name ports proto down up burst created updated resolved eff_down eff_up eff_burst source sid label
+    while IFS='|' read -r id enabled name ports proto down up burst created updated; do
+      [[ "$enabled" == "1" ]] || continue
+      ports="$(normalize_ports "$ports")"
+      [[ -n "$ports" ]] || continue
+      if ! validate_proto "$proto"; then
+        continue
+      fi
+      if ! is_non_negative_int "$down"; then down=0; fi
+      if ! is_non_negative_int "$up"; then up=0; fi
+      if ! is_non_negative_int "$burst"; then burst=32; fi
+      if [[ "$burst" -eq 0 ]]; then burst=32; fi
+      resolved="$(resolve_effective_limits "$id" "$down" "$up" "$burst")"
+      IFS='|' read -r eff_down eff_up eff_burst source sid label <<<"$resolved"
+      echo "rule=${id}|ports=${ports}|proto=${proto}|down=${eff_down}|up=${eff_up}|burst=${eff_burst}|src=${source}|sid=${sid}"
+    done < <(rules_lines)
+  } | sort
+}
+
+effective_signature_hash() {
+  build_effective_signature | cksum | awk '{print $1 ":" $2}'
+}
+
+save_effective_signature_hash() {
+  mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
+  effective_signature_hash >"$SCHEDULE_HASH_FILE"
+}
+
+tick_apply_if_needed() {
+  local current_hash previous_hash
+  current_hash="$(effective_signature_hash)"
+  if [[ -f "$SCHEDULE_HASH_FILE" ]]; then
+    previous_hash="$(cat "$SCHEDULE_HASH_FILE" 2>/dev/null || true)"
+  else
+    previous_hash=""
+  fi
+
+  if [[ -n "$previous_hash" && "$previous_hash" == "$current_hash" ]]; then
+    echo "[INFO] No schedule change detected. Skip re-apply."
+    return 0
+  fi
+
+  apply_enabled_rules || return 1
+  save_effective_signature_hash
+  echo "[INFO] Schedule change detected. tc rules refreshed."
 }
 
 apply_enabled_rules() {
@@ -703,7 +1162,7 @@ apply_enabled_rules() {
   tc class replace dev "$IFB_DEV" parent 2:1 classid 2:10 htb rate "$LINK_CEIL" ceil "$LINK_CEIL" || return 1
 
   while IFS='|' read -r id enabled name ports proto down up burst created updated; do
-    local proto_list class_up class_down p port
+    local proto_list class_up class_down p port resolved source sched_id sched_label
 
     [[ "$enabled" == "1" ]] || continue
     ((line_count++))
@@ -721,6 +1180,9 @@ apply_enabled_rules() {
     if ! is_non_negative_int "$up"; then up=0; fi
     if ! is_non_negative_int "$burst"; then burst=32; fi
     if [[ "$burst" -eq 0 ]]; then burst=32; fi
+
+    resolved="$(resolve_effective_limits "$id" "$down" "$up" "$burst")"
+    IFS='|' read -r down up burst source sched_id sched_label <<<"$resolved"
 
     if [[ "$up" -gt 0 ]]; then
       class_up="1:$cid_up"
@@ -751,6 +1213,7 @@ apply_enabled_rules() {
 
   print_ok "Applied enabled rules on $INTERFACE (ifb: $IFB_DEV)."
   log_msg "INFO" "Applied tc rules enabled_count=$(count_enabled_rules)"
+  save_effective_signature_hash
 
   if [[ "$line_count" -eq 0 ]]; then
     print_warn "No enabled rules found. Base tc structure is active."
@@ -779,12 +1242,16 @@ generate_debug_report() {
     echo "ifb: ${IFB_DEV}"
     echo "ifb-status: $(ifb_status)"
     echo "link-ceil: ${LINK_CEIL}"
+    echo "schedules: saved=$(count_saved_schedules) enabled=$(count_enabled_schedules) active_now=$(count_active_schedules_now)"
     echo
     echo "=== detected inbounds ($(detected_source_label)) ==="
     detect_inbounds || true
     echo
     echo "=== rules db ==="
     cat "$RULES_DB" 2>/dev/null || true
+    echo
+    echo "=== schedules db ==="
+    cat "$SCHEDULES_DB" 2>/dev/null || true
     echo
     echo "=== tc qdisc (main) ==="
     tc qdisc show dev "$INTERFACE" 2>/dev/null || true
@@ -956,8 +1423,35 @@ RemainAfterExit=yes
 WantedBy=multi-user.target
 EOF
 
+  cat >"$SCHEDULER_SERVICE_FILE" <<EOF
+[Unit]
+Description=Time-based scheduler tick for port bandwidth limiter
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=${BIN_PATH} --tick
+EOF
+
+  cat >"$SCHEDULER_TIMER_FILE" <<EOF
+[Unit]
+Description=Run limit-tc-port scheduler tick every minute
+
+[Timer]
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+Unit=limit-tc-port-scheduler.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
   systemctl daemon-reload
   print_ok "Service installed/updated: $SERVICE_FILE"
+  print_ok "Scheduler service: $SCHEDULER_SERVICE_FILE"
+  print_ok "Scheduler timer: $SCHEDULER_TIMER_FILE"
   print_ok "Script installed: $BIN_PATH"
 }
 
@@ -984,11 +1478,15 @@ badge_state() {
 }
 
 service_menu() {
-  local choice
+  local choice tick_cmd
   if ! has_systemd; then
     print_err "systemctl not found. Service menu is unavailable."
     pause_enter
     return 1
+  fi
+  tick_cmd="$BIN_PATH"
+  if [[ ! -x "$tick_cmd" ]]; then
+    tick_cmd="$(readlink -f "$0")"
   fi
   while true; do
     menu_header "Service Operations"
@@ -997,6 +1495,10 @@ service_menu() {
     echo "[3] Restart service"
     echo "[4] Disable + Stop service"
     echo "[5] Show service status"
+    echo "[6] Enable scheduler timer"
+    echo "[7] Disable scheduler timer"
+    echo "[8] Scheduler timer status"
+    echo "[9] Run scheduler tick now"
     echo "[0] Back"
     choice="$(prompt_input "Choice")"
     case "$choice" in
@@ -1005,6 +1507,10 @@ service_menu() {
       3) systemctl restart limit-tc-port.service && print_ok "Service restarted."; pause_enter ;;
       4) systemctl disable --now limit-tc-port.service && print_ok "Service stopped and disabled."; pause_enter ;;
       5) systemctl status --no-pager limit-tc-port.service || true; pause_enter ;;
+      6) systemctl enable --now limit-tc-port-scheduler.timer && print_ok "Scheduler timer enabled."; pause_enter ;;
+      7) systemctl disable --now limit-tc-port-scheduler.timer && print_ok "Scheduler timer disabled."; pause_enter ;;
+      8) systemctl status --no-pager limit-tc-port-scheduler.timer || true; pause_enter ;;
+      9) "$tick_cmd" --tick; pause_enter ;;
       0) return ;;
       *) echo "Invalid option."; sleep 1 ;;
     esac
@@ -1121,13 +1627,58 @@ detected_menu() {
   done
 }
 
+schedules_menu() {
+  local choice sid
+  while true; do
+    menu_header "Time Schedules"
+    echo "Saved schedules : $(count_saved_schedules)"
+    echo "Enabled         : $(count_enabled_schedules)"
+    echo "Active now      : $(count_active_schedules_now)"
+    echo
+    echo "[1] List schedules"
+    echo "[2] Add schedule window"
+    echo "[3] Edit schedule window"
+    echo "[4] Enable schedule"
+    echo "[5] Disable schedule"
+    echo "[6] Delete schedule"
+    echo "[7] Preview effective limits now"
+    echo "[8] Apply tick now"
+    echo "[0] Back"
+    choice="$(prompt_input "Choice")"
+    case "$choice" in
+      1) list_schedules; pause_enter ;;
+      2) add_schedule; pause_enter ;;
+      3) edit_schedule; pause_enter ;;
+      4)
+        list_schedules
+        sid="$(prompt_input "Schedule SID to enable")"
+        set_schedule_enabled "$sid" "1"
+        pause_enter
+        ;;
+      5)
+        list_schedules
+        sid="$(prompt_input "Schedule SID to disable")"
+        set_schedule_enabled "$sid" "0"
+        pause_enter
+        ;;
+      6) delete_schedule; pause_enter ;;
+      7) preview_effective_limits_now; pause_enter ;;
+      8) tick_apply_if_needed; pause_enter ;;
+      0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
+}
+
 render_dashboard() {
-  local selected_interface default_interface saved enabled disabled detected detected_source ifb_state host_name up_text
+  local selected_interface default_interface saved enabled disabled schedules schedules_active detected detected_source ifb_state host_name up_text
   selected_interface="${INTERFACE:-N/A}"
   default_interface="$(detect_default_interface || true)"
   saved="$(count_saved_rules)"
   enabled="$(count_enabled_rules)"
   disabled="$(count_disabled_rules)"
+  schedules="$(count_saved_schedules)"
+  schedules_active="$(count_active_schedules_now)"
   detected="$(detected_ports_csv)"
   detected_source="$(detected_source_label)"
   detected="${detected:-none}"
@@ -1152,6 +1703,7 @@ render_dashboard() {
   printf "   Saved Rules    : %s\n" "$saved"
   printf "   Enabled Rules  : %b\n" "$(badge_state "enabled") ($enabled)"
   printf "   Disabled Rules : %b\n" "$(badge_state "disabled") ($disabled)"
+  printf "   Schedules      : %s (active now: %s)\n" "$schedules" "$schedules_active"
   printf "   Detected Ports : %s\n" "$detected"
   printf "   Detected Source: %s\n" "$detected_source"
   echo
@@ -1162,7 +1714,7 @@ render_dashboard() {
   echo -e "${BLUE}----------------------------------------------------------------------${RESET}"
   echo " [1] Rules Studio   [2] Inbound Discovery   [3] Service Ops"
   echo " [4] Live Monitor   [5] Maintenance Toolkit [6] Quick Wizard"
-  echo " [7] Apply Active   [0] Quit"
+  echo " [7] Apply Active   [8] Time Schedules      [0] Quit"
 }
 
 show_help() {
@@ -1173,9 +1725,11 @@ Developed by: $APP_AUTHOR
 Usage:
   $APP_NAME                  # interactive menu
   $APP_NAME --apply          # apply enabled rules
+  $APP_NAME --tick           # apply only if schedule state changed
   $APP_NAME --clear          # clear tc rules
   $APP_NAME --status         # show tc status
   $APP_NAME --list           # list saved rules
+  $APP_NAME --list-schedules # list saved schedule windows
   $APP_NAME --install-service
   $APP_NAME --debug-report   # generate debug report in /tmp
   $APP_NAME --help
@@ -1197,6 +1751,7 @@ main_menu() {
       5) maintenance_menu ;;
       6) quick_wizard; pause_enter ;;
       7) apply_enabled_rules; pause_enter ;;
+      8) schedules_menu ;;
       0) exit 0 ;;
       *) echo "Invalid option."; sleep 1 ;;
     esac
@@ -1221,6 +1776,12 @@ main() {
       apply_enabled_rules
       exit $?
       ;;
+    --tick)
+      require_root
+      require_commands
+      tick_apply_if_needed
+      exit $?
+      ;;
     --clear)
       require_root
       require_commands
@@ -1235,6 +1796,10 @@ main() {
       ;;
     --list)
       list_rules
+      exit 0
+      ;;
+    --list-schedules)
+      list_schedules
       exit 0
       ;;
     --install-service)

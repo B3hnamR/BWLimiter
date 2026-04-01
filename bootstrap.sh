@@ -127,7 +127,9 @@ setup_service_if_available() {
 
   "$APP_BIN" --install-service >/dev/null
   systemctl enable "$SERVICE_NAME" >/dev/null 2>&1 || true
+  systemctl enable --now limit-tc-port-scheduler.timer >/dev/null 2>&1 || true
   ok "Service is installed (enabled at boot): ${SERVICE_NAME}"
+  ok "Scheduler timer is enabled: limit-tc-port-scheduler.timer"
 }
 
 launch_menu() {

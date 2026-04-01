@@ -11,6 +11,7 @@
 - شناسایی خودکار inboundها با اولویت پردازش‌های VPN (`xray`، `x-ui`، `sing-box`، `v2ray`)
 - پشتیبانی از parse مستقیم دیتابیس/کانفیگ `MHSanaei/3x-ui` (در صورت موجود بودن)
 - مدیریت کامل Rule: ساخت، ویرایش، فعال/غیرفعال، حذف
+- زمان‌بندی پیشرفته سرعت (چند بازه برای هر Rule با اولویت)
 - اعمال خودکار Ruleها بعد از ریبوت (با systemd)
 - مانیتور لحظه‌ای وضعیت `tc`
 - خروجی Debug Report برای عیب‌یابی سریع
@@ -34,7 +35,7 @@ curl -fsSL https://raw.githubusercontent.com/B3hnamR/BWLimiter/main/bootstrap.sh
 
 - وابستگی‌ها را چک/نصب می‌کند
 - اسکریپت را در `/usr/local/bin/limit-tc-port` نصب یا آپدیت می‌کند
-- اگر `systemd` فعال باشد سرویس را هم آماده می‌کند
+- اگر `systemd` فعال باشد سرویس و تایمر زمان‌بندی را هم فعال می‌کند
 - در آخر منوی تعاملی را اجرا می‌کند
 
 ## نصب دستی
@@ -63,25 +64,42 @@ sudo limit-tc-port
 - `[5]` Maintenance Toolkit
 - `[6]` Quick Wizard
 - `[7]` Apply Active
+- `[8]` Time Schedules
 - `[0]` Quit
+
+در بخش `Time Schedules` می‌توانید برای هر Rule چند پنجره زمانی تعریف کنید:
+
+- روزها: `all` یا `weekday` یا `weekend` یا لیست روزها مثل `mon,tue,fri`
+- بازه ساعت با پشتیبانی از عبور از نیمه‌شب (مثلا `23:00` تا `06:00`)
+- اولویت برای تداخل بازه‌ها (هرکدام priority بالاتر داشته باشد اعمال می‌شود)
 
 ## دستورات مستقیم CLI
 
 ```bash
 sudo limit-tc-port --apply
+sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
+sudo limit-tc-port --list-schedules
 sudo limit-tc-port --install-service
 sudo limit-tc-port --debug-report
 ```
 
 در منوی Maintenance هم گزینه `[8]` برای تولید گزارش عیب‌یابی اضافه شده و فایل را داخل `/tmp` ذخیره می‌کند.
 
+برای اعمال خودکار تغییرات زمان‌بندی در طول روز، تایمر سیستم‌دی را هم فعال کنید:
+
+```bash
+sudo systemctl enable --now limit-tc-port-scheduler.timer
+sudo systemctl status limit-tc-port-scheduler.timer
+```
+
 ## مسیر فایل‌ها
 
 - تنظیمات: `/etc/limit-tc-port/config`
 - دیتابیس Ruleها: `/etc/limit-tc-port/rules.db`
+- دیتابیس زمان‌بندی: `/etc/limit-tc-port/schedules.db`
 - لاگ: `/var/log/limit-tc-port.log`
 
 ## مسیر پیشنهادی برای تنظیم روی سرور VPN

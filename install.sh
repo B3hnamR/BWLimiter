@@ -13,9 +13,10 @@ fi
 install -m 0755 "$SCRIPT_DIR/limit-tc-port.sh" "$TARGET"
 "$TARGET" --install-service
 systemctl enable --now limit-tc-port.service
+systemctl enable --now limit-tc-port-scheduler.timer
 
 echo "Installed: $TARGET"
 echo "Service:   limit-tc-port.service (enabled)"
+echo "Timer:     limit-tc-port-scheduler.timer (enabled)"
 echo
 echo "Run: limit-tc-port"
-
