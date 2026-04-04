@@ -40,7 +40,7 @@ detect_pkg_manager() {
 
 missing_runtime_commands() {
   local cmd
-  for cmd in bash curl ip tc ss awk sort uniq paste modprobe sqlite3 jq; do
+  for cmd in bash curl ip tc ss awk sort uniq paste modprobe nft sqlite3 jq; do
     command -v "$cmd" >/dev/null 2>&1 || echo "$cmd"
   done
 }
@@ -53,22 +53,22 @@ install_deps() {
     apt)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
-      apt-get install -y iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash sqlite3 jq
+      apt-get install -y iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash nftables sqlite3 jq
       ;;
     dnf)
-      dnf install -y iproute gawk coreutils grep sed procps-ng kmod curl ca-certificates bash sqlite jq
+      dnf install -y iproute gawk coreutils grep sed procps-ng kmod curl ca-certificates bash nftables sqlite jq
       ;;
     yum)
-      yum install -y iproute gawk coreutils grep sed procps-ng kmod curl ca-certificates bash sqlite jq
+      yum install -y iproute gawk coreutils grep sed procps-ng kmod curl ca-certificates bash nftables sqlite jq
       ;;
     pacman)
-      pacman -Sy --noconfirm iproute2 gawk coreutils grep sed procps-ng kmod curl ca-certificates bash sqlite jq
+      pacman -Sy --noconfirm iproute2 gawk coreutils grep sed procps-ng kmod curl ca-certificates bash nftables sqlite jq
       ;;
     zypper)
-      zypper --non-interactive install iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash sqlite3 jq
+      zypper --non-interactive install iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash nftables sqlite3 jq
       ;;
     apk)
-      apk add --no-cache iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash sqlite jq
+      apk add --no-cache iproute2 gawk coreutils grep sed procps kmod curl ca-certificates bash nftables sqlite jq
       ;;
     *)
       err "No supported package manager found. Install dependencies manually."

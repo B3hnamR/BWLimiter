@@ -13,6 +13,7 @@ Persian guide: `README.fa.md`
 Use BWLimiter when you need to:
 
 - limit traffic by port
+- limit traffic by client IP or CIDR (with optional service port matching)
 - control upload and download separately
 - manage rules from an interactive numeric menu
 - auto-restore policy after reboot
@@ -28,6 +29,7 @@ The script is designed for real server operations, including VPN stacks like x-u
 |---|---|
 | Traffic shaping | HTB classes with `tc`, ingress redirect to `ifb` for download control |
 | Rule model | Add/edit/enable/disable/delete/list/apply rules without destructive reset |
+| IP/CIDR policies | Mark-based shaping with `nftables` + `tc fw`, designed for higher rule counts |
 | Protocol control | `tcp`, `udp`, or `both` |
 | Multi-port support | One rule can target multiple ports |
 | Inbound discovery | VPN-aware discovery + 3x-ui DB/config parsing fallback chain |
@@ -58,6 +60,7 @@ Required:
 - Linux
 - root privileges (`sudo`)
 - `iproute2` (`tc`, `ip`, `ss`)
+- `nftables` (`nft`) for IP/CIDR limiting
 - `kmod` (`modprobe`)
 - `systemd` (for service/timer automation)
 
@@ -120,6 +123,7 @@ Important submenus:
 - `Service Ops`: service install/start/stop + scheduler timer control
 - `Maintenance Toolkit`: interface selection, IFB config, debug report, safe apply, conflict checks, snapshot rollback
 - `Time Schedules`: create/edit/enable/disable/delete schedule windows
+- `Rules Studio > [9] IP/CIDR rules`: manage IP/CIDR-based limits
 
 ---
 
@@ -151,6 +155,7 @@ sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
+sudo limit-tc-port --list-ip-rules
 sudo limit-tc-port --list-schedules
 sudo limit-tc-port --conflict-check
 sudo limit-tc-port --list-snapshots
@@ -195,17 +200,40 @@ Execution model:
 
 ---
 
-## 10) File Layout
+## 10) Per-IP/CIDR Architecture (High-Scale Path)
+
+BWLimiter keeps classic per-port shaping, and adds an IP/CIDR policy engine with `nftables` marking:
+
+1. `nft` marks matching packets in `prerouting` (download) and `output` (upload)
+2. `tc` maps those marks to dedicated HTB classes via `fw` filters
+3. class rates enforce per-IP/CIDR limits independently from base port rules
+
+Why this scales better:
+
+- avoids huge `u32` filter growth for every IP+port tuple
+- uses compact nft expressions for CIDR and port lists
+- keeps enforcement in kernel datapath with low control-plane overhead
+
+Current scope of IP policies:
+
+- IPv4/CIDR matching
+- optional service port match (`any` or CSV list)
+- protocol-specific (`tcp`, `udp`, `both`)
+
+---
+
+## 11) File Layout
 
 - Config: `/etc/limit-tc-port/config`
 - Rules DB: `/etc/limit-tc-port/rules.db`
 - Schedules DB: `/etc/limit-tc-port/schedules.db`
+- IP Rules DB: `/etc/limit-tc-port/iprules.db`
 - Runtime hash/state: `/run/limit-tc-port/`
 - Log: `/var/log/limit-tc-port.log`
 
 ---
 
-## 11) First Practical Setup (Example)
+## 12) First Practical Setup (Example)
 
 1. Open `Rules Studio` and create a rule for your inbound port (for example `8080`).
 2. Set base limits (example: down `24576`, up `24576` for about 3 MB/s).
@@ -218,7 +246,7 @@ Execution model:
 
 ---
 
-## 12) Troubleshooting
+## 13) Troubleshooting
 
 Generate report:
 
@@ -242,14 +270,14 @@ What to verify first:
 
 ---
 
-## 13) Known Scope Limits
+## 14) Known Scope Limits
 
 - Filter path is currently IPv4-focused (`protocol ip` with `u32`).
-- Policy is port-based, not strict per-user shaping.
+- Per-user shaping from x-ui account identity is not implemented (policy works at network IP/CIDR level).
 
 ---
 
-## 14) Acknowledgment and Attribution
+## 15) Acknowledgment and Attribution
 
 The idea and general concept behind this project were inspired by the Telegram channel **KillNationChannel**. However, the actual implementation, structure, and source code in this repository were independently written and developed by me.
 

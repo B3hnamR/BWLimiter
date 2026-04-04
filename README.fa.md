@@ -11,6 +11,7 @@
 با BWLimiter می‌توانی:
 
 - برای هر پورت، سرعت Upload و Download جدا تعریف کنی
+- بر اساس IP یا CIDR هم محدودیت بسازی (با امکان شرط روی پورت سرویس)
 - روی چند پورت با یک Rule محدودیت بگذاری
 - برای `tcp`، `udp` یا هر دو Rule بسازی
 - Ruleها را ذخیره، ویرایش، فعال/غیرفعال یا حذف کنی
@@ -25,6 +26,7 @@
 | بخش | خروجی |
 |---|---|
 | کنترل ترافیک | محدودیت بر پایه پورت با `tc`/`ifb` |
+| سیاست IP/CIDR | محدودسازی مبتنی بر `nftables` + `tc fw` برای مقیاس بالاتر |
 | Rule Management | ساخت، ویرایش، حذف، فعال/غیرفعال، اعمال مجدد |
 | تشخیص Inbound | تشخیص هوشمند با اولویت محیط VPN/3x-ui |
 | زمان‌بندی | تعداد نامحدود پنجره زمانی برای هر Rule |
@@ -54,6 +56,7 @@
 - Linux
 - دسترسی root یا `sudo`
 - `iproute2` (`tc`, `ip`, `ss`)
+- `nftables` (`nft`) برای قابلیت IP/CIDR
 - `kmod` (`modprobe`)
 - `systemd` (برای اجرای خودکار)
 
@@ -116,6 +119,7 @@ sudo limit-tc-port
 - `Service Ops`: مدیریت سرویس اصلی + تایمر زمان‌بندی
 - `Maintenance Toolkit`: انتخاب اینترفیس، تنظیم IFB، گزارش Debug، Safe Apply، بررسی Conflict، Snapshot/Rollback
 - `Time Schedules`: تعریف پنجره‌های زمانی روی Ruleها
+- `Rules Studio > [9] IP/CIDR rules`: مدیریت Ruleهای محدودسازی بر اساس IP/CIDR
 
 ---
 
@@ -147,6 +151,7 @@ sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
+sudo limit-tc-port --list-ip-rules
 sudo limit-tc-port --list-schedules
 sudo limit-tc-port --conflict-check
 sudo limit-tc-port --list-snapshots
@@ -191,17 +196,40 @@ sudo systemctl status limit-tc-port-scheduler.timer
 
 ---
 
-## 10) مسیر فایل‌ها
+## 10) معماری Per-IP/CIDR (مسیر مقیاس بالا)
+
+در کنار Ruleهای پورتی، برای IP/CIDR از مسیر `nftables` + `tc` استفاده می‌شود:
+
+1. بسته‌های منطبق در `prerouting` (دانلود) و `output` (آپلود) با `nft` مارک می‌شوند
+2. `tc` این مارک‌ها را با `fw` filter به کلاس HTB وصل می‌کند
+3. سرعت کلاس، محدودیت واقعی هر IP/CIDR را اعمال می‌کند
+
+چرا این مسیر بهتر مقیاس می‌گیرد:
+
+- تعداد فیلترهای `u32` بی‌رویه زیاد نمی‌شود
+- برای CIDR و پورت‌ها از expression فشرده‌تر استفاده می‌شود
+- کل Enforcement داخل kernel path انجام می‌شود
+
+محدوده فعلی این بخش:
+
+- فقط IPv4/CIDR
+- شرط روی پورت: `any` یا لیست پورت
+- پروتکل: `tcp` یا `udp` یا `both`
+
+---
+
+## 11) مسیر فایل‌ها
 
 - تنظیمات: `/etc/limit-tc-port/config`
 - دیتابیس Ruleها: `/etc/limit-tc-port/rules.db`
 - دیتابیس زمان‌بندی: `/etc/limit-tc-port/schedules.db`
+- دیتابیس IP/CIDR: `/etc/limit-tc-port/iprules.db`
 - وضعیت اجرایی: `/run/limit-tc-port/`
 - لاگ: `/var/log/limit-tc-port.log`
 
 ---
 
-## 11) سناریوی شروع سریع (عملی)
+## 12) سناریوی شروع سریع (عملی)
 
 1. از `Rules Studio` یک Rule برای پورت سرویس‌ات بساز (مثلاً `8080`).
 2. سرعت پایه بده (مثلاً حدود 3MB/s برابر `24576` kbit).
@@ -214,7 +242,7 @@ sudo systemctl status limit-tc-port-scheduler.timer
 
 ---
 
-## 12) عیب‌یابی
+## 13) عیب‌یابی
 
 گزارش بگیر:
 
@@ -238,10 +266,10 @@ cat /tmp/limit-tc-port-debug-*.log
 
 ---
 
-## 13) محدوده فعلی پروژه
+## 14) محدوده فعلی پروژه
 
 - مسیر فیلترینگ فعلی روی IPv4 متمرکز است (`protocol ip` + `u32`).
-- محدودسازی این پروژه per-port است، نه per-user واقعی.
+- محدودسازی per-user بر اساس هویت داخلی اکانت‌های x-ui پیاده‌سازی نشده و کنترل در سطح IP/CIDR انجام می‌شود.
 
 ---
 

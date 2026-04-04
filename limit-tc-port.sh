@@ -8,6 +8,7 @@ CONFIG_DIR="/etc/limit-tc-port"
 CONFIG_FILE="$CONFIG_DIR/config"
 RULES_DB="$CONFIG_DIR/rules.db"
 SCHEDULES_DB="$CONFIG_DIR/schedules.db"
+IPRULES_DB="$CONFIG_DIR/iprules.db"
 SNAPSHOTS_DIR="$CONFIG_DIR/snapshots"
 LOG_FILE="/var/log/limit-tc-port.log"
 SERVICE_FILE="/etc/systemd/system/limit-tc-port.service"
@@ -16,6 +17,8 @@ SCHEDULER_TIMER_FILE="/etc/systemd/system/limit-tc-port-scheduler.timer"
 BIN_PATH="/usr/local/bin/limit-tc-port"
 STATE_DIR="/run/limit-tc-port"
 SCHEDULE_HASH_FILE="$STATE_DIR/schedule.hash"
+NFT_TABLE_FAMILY="inet"
+NFT_TABLE_NAME="limit_tc_port"
 
 INTERFACE=""
 IFB_DEV="ifb0"
@@ -104,6 +107,11 @@ EOF
 # sid|rule_id|enabled|label|days|start_hhmm|end_hhmm|down_kbit|up_kbit|burst_kb|priority|created_at|updated_at
 EOF
   fi
+  if [[ ! -f "$IPRULES_DB" ]]; then
+    cat >"$IPRULES_DB" <<'EOF'
+# iid|enabled|name|cidrs|ports|proto|down_kbit|up_kbit|burst_kb|created_at|updated_at
+EOF
+  fi
 }
 
 save_config() {
@@ -143,6 +151,10 @@ rules_lines() {
   grep -Ev '^[[:space:]]*#|^[[:space:]]*$' "$RULES_DB" || true
 }
 
+ip_rules_lines() {
+  grep -Ev '^[[:space:]]*#|^[[:space:]]*$' "$IPRULES_DB" || true
+}
+
 count_saved_rules() {
   rules_lines | wc -l | awk '{print $1}'
 }
@@ -156,6 +168,14 @@ count_disabled_rules() {
   total="$(count_saved_rules)"
   enabled="$(count_enabled_rules)"
   echo $((total - enabled))
+}
+
+count_saved_ip_rules() {
+  ip_rules_lines | wc -l | awk '{print $1}'
+}
+
+count_enabled_ip_rules() {
+  ip_rules_lines | awk -F'|' '$2=="1"{c++} END{print c+0}'
 }
 
 schedules_lines() {
@@ -212,6 +232,28 @@ detect_rule_port_proto_overlaps() {
   }'
 }
 
+detect_ip_rule_exact_overlaps() {
+  local iid enabled name cidrs ports proto down up burst created updated
+  while IFS='|' read -r iid enabled name cidrs ports proto down up burst created updated; do
+    [[ "$enabled" == "1" ]] || continue
+    cidrs="$(normalize_ipv4_cidrs "$cidrs")"
+    ports="$(normalize_ports_or_any "$ports")"
+    proto="$(to_lower "$proto")"
+    [[ -n "$cidrs" ]] || continue
+    [[ -n "$ports" ]] || ports="any"
+    echo "$cidrs|$ports|$proto|$iid"
+  done < <(ip_rules_lines) | awk -F'|' '
+  {
+    k=$1 "|" $2 "|" $3;
+    c[k]++;
+    if (ids[k]=="") ids[k]=$4;
+    else ids[k]=ids[k] "," $4;
+  }
+  END {
+    for (k in c) if (c[k] > 1) print k "|" ids[k];
+  }'
+}
+
 detect_schedule_same_priority_groups() {
   schedules_lines | awk -F'|' '
   $3=="1" {
@@ -228,7 +270,7 @@ detect_schedule_same_priority_groups() {
 run_conflict_guard() {
   local failed=0
   local min_kbit
-  local overlaps same_prio
+  local overlaps ip_overlaps same_prio
 
   min_kbit="${MIN_PROTECTED_KBIT:-128}"
   if ! is_non_negative_int "$min_kbit" || [[ "$min_kbit" -eq 0 ]]; then
@@ -242,6 +284,20 @@ run_conflict_guard() {
       [[ -n "${port:-}" ]] || continue
       echo "  - port=$port proto=$proto rules=$ids"
     done <<<"$overlaps"
+    failed=1
+  fi
+
+  ip_overlaps="$(detect_ip_rule_exact_overlaps)"
+  if [[ -n "$ip_overlaps" ]]; then
+    print_warn "Conflict guard: duplicate enabled IP rules detected (same CIDRs+ports+proto)."
+    while IFS='|' read -r cidrs ports proto ids; do
+      [[ -n "${cidrs:-}" ]] || continue
+      echo "  - cidrs=$cidrs ports=$ports proto=$proto rules=$ids"
+    done <<<"$ip_overlaps"
+  fi
+
+  if [[ "$(count_enabled_ip_rules)" -gt 0 ]] && ! has_command nft; then
+    print_err "Conflict guard: nft command is required when any IP/CIDR rule is enabled."
     failed=1
   fi
 
@@ -272,6 +328,36 @@ run_conflict_guard() {
       done
     done
   done < <(rules_lines)
+
+  local iid i_enabled i_name i_cidrs i_ports i_proto i_down i_up i_burst i_created i_updated
+  while IFS='|' read -r iid i_enabled i_name i_cidrs i_ports i_proto i_down i_up i_burst i_created i_updated; do
+    [[ "$i_enabled" == "1" ]] || continue
+    validate_proto "$i_proto" || continue
+    is_non_negative_int "$i_down" || i_down=0
+    is_non_negative_int "$i_up" || i_up=0
+
+    local check_protected=0
+    if [[ "$i_ports" == "any" || "$i_ports" == "*" || -z "$i_ports" ]]; then
+      check_protected=1
+    else
+      local pp
+      for pp in ${i_ports//,/ }; do
+        if is_port_protected "$pp"; then
+          check_protected=1
+          break
+        fi
+      done
+    fi
+
+    if [[ "$check_protected" -eq 1 ]]; then
+      if [[ "$i_proto" == "tcp" || "$i_proto" == "both" ]]; then
+        if (( i_down < min_kbit || i_up < min_kbit )); then
+          print_err "Conflict guard: protected-port safety violated by IP rule $iid (down=$i_down up=$i_up kbit, min=$min_kbit)."
+          failed=1
+        fi
+      fi
+    fi
+  done < <(ip_rules_lines)
 
   same_prio="$(detect_schedule_same_priority_groups)"
   if [[ -n "$same_prio" ]]; then
@@ -304,6 +390,7 @@ create_policy_snapshot() {
   [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$dir/config" >/dev/null 2>&1 || true
   [[ -f "$RULES_DB" ]] && cp "$RULES_DB" "$dir/rules.db" >/dev/null 2>&1 || true
   [[ -f "$SCHEDULES_DB" ]] && cp "$SCHEDULES_DB" "$dir/schedules.db" >/dev/null 2>&1 || true
+  [[ -f "$IPRULES_DB" ]] && cp "$IPRULES_DB" "$dir/iprules.db" >/dev/null 2>&1 || true
 
   {
     echo "id=$sid"
@@ -313,6 +400,7 @@ create_policy_snapshot() {
     echo "ifb=${IFB_DEV:-N/A}"
     echo "rules=$(count_saved_rules)"
     echo "schedules=$(count_saved_schedules)"
+    echo "ip_rules=$(count_saved_ip_rules)"
   } >"$dir/meta.env"
 
   if [[ -n "${INTERFACE:-}" ]]; then
@@ -360,6 +448,7 @@ restore_policy_snapshot_files() {
   [[ -f "$dir/config" ]] && cp "$dir/config" "$CONFIG_FILE"
   [[ -f "$dir/rules.db" ]] && cp "$dir/rules.db" "$RULES_DB"
   [[ -f "$dir/schedules.db" ]] && cp "$dir/schedules.db" "$SCHEDULES_DB"
+  [[ -f "$dir/iprules.db" ]] && cp "$dir/iprules.db" "$IPRULES_DB"
   load_config
   return 0
 }
@@ -433,6 +522,25 @@ validate_ports() {
   return 0
 }
 
+validate_ports_or_any() {
+  local v
+  v="$(echo "${1:-}" | tr -d '[:space:]')"
+  if [[ -z "$v" || "$v" == "any" || "$v" == "*" ]]; then
+    return 0
+  fi
+  validate_ports "$v"
+}
+
+normalize_ports_or_any() {
+  local v
+  v="$(echo "${1:-}" | tr -d '[:space:]')"
+  if [[ -z "$v" || "$v" == "any" || "$v" == "*" ]]; then
+    echo "any"
+    return
+  fi
+  normalize_ports "$v"
+}
+
 normalize_ports() {
   echo "$1" \
     | tr -d '[:space:]' \
@@ -441,6 +549,56 @@ normalize_ports() {
     | sort -n \
     | uniq \
     | paste -sd, -
+}
+
+is_valid_ipv4() {
+  local ip="$1" IFS=.
+  local -a o
+  read -r -a o <<<"$ip"
+  [[ ${#o[@]} -eq 4 ]] || return 1
+  local x
+  for x in "${o[@]}"; do
+    [[ "$x" =~ ^[0-9]+$ ]] || return 1
+    ((x >= 0 && x <= 255)) || return 1
+  done
+}
+
+normalize_ipv4_cidr_token() {
+  local token="$1" ip prefix
+  token="$(echo "$token" | tr -d '[:space:]')"
+  [[ -n "$token" ]] || return 1
+
+  if [[ "$token" == */* ]]; then
+    ip="${token%%/*}"
+    prefix="${token##*/}"
+    is_valid_ipv4 "$ip" || return 1
+    [[ "$prefix" =~ ^[0-9]+$ ]] || return 1
+    ((prefix >= 0 && prefix <= 32)) || return 1
+    echo "$ip/$prefix"
+    return 0
+  fi
+
+  is_valid_ipv4 "$token" || return 1
+  echo "$token/32"
+}
+
+validate_ipv4_cidrs() {
+  local raw t
+  raw="$(echo "${1:-}" | tr -d '[:space:]')"
+  [[ -n "$raw" ]] || return 1
+  IFS=',' read -r -a _cidrs <<<"$raw"
+  for t in "${_cidrs[@]}"; do
+    normalize_ipv4_cidr_token "$t" >/dev/null || return 1
+  done
+}
+
+normalize_ipv4_cidrs() {
+  local raw t
+  raw="$(echo "${1:-}" | tr -d '[:space:]')"
+  IFS=',' read -r -a _cidrs <<<"$raw"
+  for t in "${_cidrs[@]}"; do
+    normalize_ipv4_cidr_token "$t" || true
+  done | sort -u | paste -sd, -
 }
 
 validate_proto() {
@@ -1283,6 +1441,198 @@ delete_rule() {
   print_ok "Rule $id deleted."
 }
 
+next_ip_rule_id() {
+  local max_id
+  max_id="$(ip_rules_lines | awk -F'|' 'BEGIN{m=0} {if($1+0>m)m=$1+0} END{print m+0}')"
+  echo $((max_id + 1))
+}
+
+get_ip_rule_by_id() {
+  local iid="$1"
+  ip_rules_lines | awk -F'|' -v x="$iid" '$1==x{print; exit}'
+}
+
+replace_ip_rule_line() {
+  local iid="$1" new_line="$2" tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v x="$iid" -v nl="$new_line" '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next}
+  $1==x {print nl; found=1; next}
+  {print}
+  END {if(found!=1) exit 1}
+  ' "$IPRULES_DB" >"$tmp_file" && mv "$tmp_file" "$IPRULES_DB"
+}
+
+delete_ip_rule_line() {
+  local iid="$1" tmp_file
+  tmp_file="$(mktemp)"
+  awk -F'|' -v x="$iid" '
+  /^[[:space:]]*#/ || /^[[:space:]]*$/ {print; next}
+  $1==x {found=1; next}
+  {print}
+  END {if(found!=1) exit 1}
+  ' "$IPRULES_DB" >"$tmp_file" && mv "$tmp_file" "$IPRULES_DB"
+}
+
+list_ip_rules() {
+  local count
+  count="$(count_saved_ip_rules)"
+  if [[ "$count" -eq 0 ]]; then
+    echo "No saved IP/CIDR rules."
+    return
+  fi
+  printf "%-4s %-7s %-18s %-24s %-12s %-8s %-8s %-8s %-8s\n" \
+    "ID" "Status" "Name" "CIDRs" "Ports" "Proto" "Down" "Up" "Burst"
+  printf "%-4s %-7s %-18s %-24s %-12s %-8s %-8s %-8s %-8s\n" \
+    "----" "-------" "------------------" "------------------------" "------------" "--------" "--------" "--------" "--------"
+  local iid enabled name cidrs ports proto down up burst created updated status
+  while IFS='|' read -r iid enabled name cidrs ports proto down up burst created updated; do
+    status="OFF"
+    [[ "$enabled" == "1" ]] && status="ON"
+    printf "%-4s %-7s %-18s %-24s %-12s %-8s %-8s %-8s %-8s\n" \
+      "$iid" "$status" "$name" "${cidrs:0:24}" "$ports" "$proto" "$down" "$up" "$burst"
+  done < <(ip_rules_lines)
+}
+
+add_ip_rule() {
+  local iid name cidrs ports proto down up burst enabled now line
+  iid="$(next_ip_rule_id)"
+  name="$(sanitize_label "$(prompt_input "IP rule name" "iprule-$iid")")"
+
+  while true; do
+    cidrs="$(prompt_input "IPv4 / CIDR list (comma separated)" "")"
+    if validate_ipv4_cidrs "$cidrs"; then
+      cidrs="$(normalize_ipv4_cidrs "$cidrs")"
+      break
+    fi
+    echo "Invalid IPv4/CIDR list. Example: 1.2.3.4,5.6.7.0/24"
+  done
+
+  while true; do
+    ports="$(prompt_input "Service ports (comma separated or 'any')" "any")"
+    if validate_ports_or_any "$ports"; then
+      ports="$(normalize_ports_or_any "$ports")"
+      break
+    fi
+    echo "Invalid ports."
+  done
+
+  while true; do
+    proto="$(to_lower "$(prompt_input "Protocol (tcp|udp|both)" "both")")"
+    validate_proto "$proto" && break
+    echo "Invalid protocol."
+  done
+
+  down="$(prompt_non_negative_int "Download limit (kbit, 0=off)" "0")"
+  up="$(prompt_non_negative_int "Upload limit (kbit, 0=off)" "0")"
+  if [[ "$down" -eq 0 && "$up" -eq 0 ]]; then
+    print_err "Both download and upload cannot be 0."
+    return 1
+  fi
+
+  burst="$(prompt_non_negative_int "Burst (kb)" "32")"
+  [[ "$burst" -eq 0 ]] && burst=32
+
+  if prompt_yes_no "Enable this IP rule now?" "y"; then
+    enabled=1
+  else
+    enabled=0
+  fi
+
+  now="$(ts)"
+  line="$iid|$enabled|$name|$cidrs|$ports|$proto|$down|$up|$burst|$now|$now"
+  echo "$line" >>"$IPRULES_DB"
+  print_ok "IP rule $iid saved."
+}
+
+edit_ip_rule() {
+  local iid line enabled name cidrs ports proto down up burst created updated now
+  list_ip_rules
+  echo
+  iid="$(prompt_input "IP rule ID to edit")"
+  line="$(get_ip_rule_by_id "$iid")"
+  if [[ -z "$line" ]]; then
+    print_err "IP rule not found."
+    return 1
+  fi
+  IFS='|' read -r iid enabled name cidrs ports proto down up burst created updated <<<"$line"
+
+  name="$(sanitize_label "$(prompt_input "IP rule name" "$name")")"
+  while true; do
+    cidrs="$(prompt_input "IPv4 / CIDR list (comma separated)" "$cidrs")"
+    if validate_ipv4_cidrs "$cidrs"; then
+      cidrs="$(normalize_ipv4_cidrs "$cidrs")"
+      break
+    fi
+    echo "Invalid IPv4/CIDR list."
+  done
+  while true; do
+    ports="$(prompt_input "Service ports (comma separated or 'any')" "$ports")"
+    if validate_ports_or_any "$ports"; then
+      ports="$(normalize_ports_or_any "$ports")"
+      break
+    fi
+    echo "Invalid ports."
+  done
+  while true; do
+    proto="$(to_lower "$(prompt_input "Protocol (tcp|udp|both)" "$proto")")"
+    validate_proto "$proto" && break
+    echo "Invalid protocol."
+  done
+
+  down="$(prompt_non_negative_int "Download limit (kbit, 0=off)" "$down")"
+  up="$(prompt_non_negative_int "Upload limit (kbit, 0=off)" "$up")"
+  if [[ "$down" -eq 0 && "$up" -eq 0 ]]; then
+    print_err "Both download and upload cannot be 0."
+    return 1
+  fi
+
+  burst="$(prompt_non_negative_int "Burst (kb)" "$burst")"
+  [[ "$burst" -eq 0 ]] && burst=32
+  now="$(ts)"
+  replace_ip_rule_line "$iid" "$iid|$enabled|$name|$cidrs|$ports|$proto|$down|$up|$burst|$created|$now" || {
+    print_err "Failed to update IP rule."
+    return 1
+  }
+  print_ok "IP rule $iid updated."
+}
+
+set_ip_rule_enabled() {
+  local iid="$1" target="$2"
+  local line enabled name cidrs ports proto down up burst created updated
+  line="$(get_ip_rule_by_id "$iid")"
+  if [[ -z "$line" ]]; then
+    print_err "IP rule not found."
+    return 1
+  fi
+  IFS='|' read -r iid enabled name cidrs ports proto down up burst created updated <<<"$line"
+  replace_ip_rule_line "$iid" "$iid|$target|$name|$cidrs|$ports|$proto|$down|$up|$burst|$created|$(ts)" || {
+    print_err "Failed to update IP rule state."
+    return 1
+  }
+  if [[ "$target" == "1" ]]; then
+    print_ok "IP rule $iid enabled."
+  else
+    print_ok "IP rule $iid disabled."
+  fi
+}
+
+delete_ip_rule() {
+  local iid
+  list_ip_rules
+  echo
+  iid="$(prompt_input "IP rule ID to delete")"
+  if ! prompt_yes_no "Delete IP rule $iid ?" "n"; then
+    echo "Cancelled."
+    return 0
+  fi
+  delete_ip_rule_line "$iid" || {
+    print_err "IP rule not found."
+    return 1
+  }
+  print_ok "IP rule $iid deleted."
+}
+
 setup_ifb() {
   modprobe ifb numifbs=1 >/dev/null 2>&1 || modprobe ifb >/dev/null 2>&1 || true
   if ! ip link show "$IFB_DEV" >/dev/null 2>&1; then
@@ -1299,6 +1649,7 @@ clear_tc() {
   tc qdisc del dev "$INTERFACE" root >/dev/null 2>&1 || true
   tc qdisc del dev "$INTERFACE" ingress >/dev/null 2>&1 || true
   tc qdisc del dev "$IFB_DEV" root >/dev/null 2>&1 || true
+  clear_nft_policy
   rm -f "$SCHEDULE_HASH_FILE" >/dev/null 2>&1 || true
 }
 
@@ -1324,11 +1675,164 @@ add_port_filter() {
     flowid "$classid" >/dev/null 2>&1
 }
 
+nft_table_exists() {
+  has_command nft || return 1
+  nft list table "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" >/dev/null 2>&1
+}
+
+clear_nft_policy() {
+  if nft_table_exists; then
+    nft delete table "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" >/dev/null 2>&1 || true
+  fi
+}
+
+ensure_nft_base() {
+  has_command nft || {
+    print_err "nft command is required for IP/CIDR limiting."
+    return 1
+  }
+
+  clear_nft_policy
+  nft add table "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" >/dev/null 2>&1 || return 1
+  nft add chain "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" prerouting "{ type filter hook prerouting priority mangle; policy accept; }" >/dev/null 2>&1 || return 1
+  nft add chain "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" output "{ type route hook output priority mangle; policy accept; }" >/dev/null 2>&1 || return 1
+  return 0
+}
+
+tc_add_fw_filter() {
+  local dev="$1" parent="$2" mark="$3" classid="$4" prio="$5"
+  tc filter add dev "$dev" parent "$parent" protocol ip prio "$prio" handle "$mark" fw flowid "$classid" >/dev/null 2>&1
+}
+
+nft_csv_to_set_expr() {
+  local csv="$1"
+  local formatted
+  formatted="$(echo "$csv" | tr -d '[:space:]' | sed 's/,/, /g')"
+  if [[ "$formatted" == *,* ]]; then
+    echo "{ $formatted }"
+  else
+    echo "$formatted"
+  fi
+}
+
+nft_exec_cmd() {
+  local cmd="$1"
+  nft -f - >/dev/null 2>&1 <<EOF
+$cmd
+EOF
+}
+
+nft_add_mark_rule() {
+  local chain="$1" cidrs="$2" proto="$3" ports="$4" mark="$5" direction="$6"
+  local addr_field port_field addr_expr port_expr cmd
+  addr_expr="$(nft_csv_to_set_expr "$cidrs")"
+
+  if [[ "$direction" == "download" ]]; then
+    addr_field="saddr"
+    port_field="dport"
+  else
+    addr_field="daddr"
+    port_field="sport"
+  fi
+
+  if [[ "$ports" == "any" ]]; then
+    cmd="add rule $NFT_TABLE_FAMILY $NFT_TABLE_NAME $chain ip $addr_field $addr_expr meta l4proto $proto meta mark set $mark"
+    nft_exec_cmd "$cmd"
+    return $?
+  fi
+
+  port_expr="$(nft_csv_to_set_expr "$ports")"
+  cmd="add rule $NFT_TABLE_FAMILY $NFT_TABLE_NAME $chain ip $addr_field $addr_expr $proto $port_field $port_expr meta mark set $mark"
+  nft_exec_cmd "$cmd"
+}
+
+apply_ip_rules_with_marks() {
+  local cid_up_ref="$1"
+  local cid_down_ref="$2"
+  local prio_up_ref="$3"
+  local prio_down_ref="$4"
+  local mark_seed=1000
+  local has_enabled=0
+
+  if [[ "$(count_enabled_ip_rules)" -eq 0 ]]; then
+    clear_nft_policy
+    return 0
+  fi
+
+  ensure_nft_base || return 1
+
+  local cid_up cid_down prio_up prio_down
+  cid_up="$cid_up_ref"
+  cid_down="$cid_down_ref"
+  prio_up="$prio_up_ref"
+  prio_down="$prio_down_ref"
+
+  local iid enabled name cidrs ports proto down up burst created updated
+    local p up_mark down_mark class_up class_down
+
+  while IFS='|' read -r iid enabled name cidrs ports proto down up burst created updated; do
+    [[ "$enabled" == "1" ]] || continue
+    has_enabled=1
+
+    cidrs="$(normalize_ipv4_cidrs "$cidrs")"
+    [[ -n "$cidrs" ]] || continue
+    validate_proto "$proto" || continue
+    ports="$(normalize_ports_or_any "$ports")"
+    [[ -n "$ports" ]] || ports="any"
+    is_non_negative_int "$down" || down=0
+    is_non_negative_int "$up" || up=0
+    is_non_negative_int "$burst" || burst=32
+    [[ "$burst" -eq 0 ]] && burst=32
+
+    up_mark=$((mark_seed + iid * 2))
+    down_mark=$((mark_seed + iid * 2 + 1))
+
+    if [[ "$up" -gt 0 ]]; then
+      class_up="1:$cid_up"
+      tc class replace dev "$INTERFACE" parent 1:1 classid "$class_up" htb \
+        rate "${up}kbit" ceil "${up}kbit" burst "${burst}kb" || continue
+      tc_add_fw_filter "$INTERFACE" "1:" "$up_mark" "$class_up" "$prio_up" || true
+      ((prio_up++))
+      ((cid_up++))
+    fi
+
+    if [[ "$down" -gt 0 ]]; then
+      class_down="2:$cid_down"
+      tc class replace dev "$IFB_DEV" parent 2:1 classid "$class_down" htb \
+        rate "${down}kbit" ceil "${down}kbit" burst "${burst}kb" || continue
+      tc_add_fw_filter "$IFB_DEV" "2:" "$down_mark" "$class_down" "$prio_down" || true
+      ((prio_down++))
+      ((cid_down++))
+    fi
+
+    for p in $(proto_words "$proto"); do
+      if [[ "$up" -gt 0 ]]; then
+        nft_add_mark_rule "output" "$cidrs" "$p" "$ports" "$up_mark" "upload" || true
+      fi
+      if [[ "$down" -gt 0 ]]; then
+        nft_add_mark_rule "prerouting" "$cidrs" "$p" "$ports" "$down_mark" "download" || true
+      fi
+    done
+  done < <(ip_rules_lines)
+
+  if [[ "$has_enabled" -eq 0 ]]; then
+    clear_nft_policy
+  fi
+
+  printf -v "$cid_up_ref" '%s' "$cid_up"
+  printf -v "$cid_down_ref" '%s' "$cid_down"
+  printf -v "$prio_up_ref" '%s' "$prio_up"
+  printf -v "$prio_down_ref" '%s' "$prio_down"
+  return 0
+}
+
 build_effective_signature() {
   {
     echo "interface=${INTERFACE}"
     echo "ifb=${IFB_DEV}"
     echo "link_ceil=${LINK_CEIL}"
+    echo "protected_ports=${PROTECTED_PORTS}"
+    echo "min_protected_kbit=${MIN_PROTECTED_KBIT}"
     local id enabled name ports proto down up burst created updated resolved eff_down eff_up eff_burst source sid label
     while IFS='|' read -r id enabled name ports proto down up burst created updated; do
       [[ "$enabled" == "1" ]] || continue
@@ -1345,6 +1849,19 @@ build_effective_signature() {
       IFS='|' read -r eff_down eff_up eff_burst source sid label <<<"$resolved"
       echo "rule=${id}|ports=${ports}|proto=${proto}|down=${eff_down}|up=${eff_up}|burst=${eff_burst}|src=${source}|sid=${sid}"
     done < <(rules_lines)
+
+    local iid i_enabled i_name i_cidrs i_ports i_proto i_down i_up i_burst i_created i_updated
+    while IFS='|' read -r iid i_enabled i_name i_cidrs i_ports i_proto i_down i_up i_burst i_created i_updated; do
+      [[ "$i_enabled" == "1" ]] || continue
+      i_cidrs="$(normalize_ipv4_cidrs "$i_cidrs")"
+      i_ports="$(normalize_ports_or_any "$i_ports")"
+      validate_proto "$i_proto" || continue
+      is_non_negative_int "$i_down" || i_down=0
+      is_non_negative_int "$i_up" || i_up=0
+      is_non_negative_int "$i_burst" || i_burst=32
+      [[ "$i_burst" -eq 0 ]] && i_burst=32
+      echo "iprule=${iid}|cidrs=${i_cidrs}|ports=${i_ports}|proto=${i_proto}|down=${i_down}|up=${i_up}|burst=${i_burst}"
+    done < <(ip_rules_lines)
   } | sort
 }
 
@@ -1462,8 +1979,13 @@ apply_enabled_rules() {
     fi
   done < <(rules_lines)
 
+  apply_ip_rules_with_marks cid_up cid_down prio_up prio_down || {
+    print_err "Failed to apply IP/CIDR mark-based policies."
+    return 1
+  }
+
   print_ok "Applied enabled rules on $INTERFACE (ifb: $IFB_DEV)."
-  log_msg "INFO" "Applied tc rules enabled_count=$(count_enabled_rules)"
+  log_msg "INFO" "Applied tc rules enabled_rules=$(count_enabled_rules) enabled_ip_rules=$(count_enabled_ip_rules)"
   save_effective_signature_hash
 
   if [[ "$line_count" -eq 0 ]]; then
@@ -1496,6 +2018,7 @@ generate_debug_report() {
     echo "protected_ports: ${PROTECTED_PORTS:-none}"
     echo "min_protected_kbit: ${MIN_PROTECTED_KBIT}"
     echo "schedules: saved=$(count_saved_schedules) enabled=$(count_enabled_schedules) active_now=$(count_active_schedules_now)"
+    echo "ip_rules: saved=$(count_saved_ip_rules) enabled=$(count_enabled_ip_rules)"
     echo "snapshots: $(count_snapshots)"
     echo
     echo "=== detected inbounds ($(detected_source_label)) ==="
@@ -1506,6 +2029,9 @@ generate_debug_report() {
     echo
     echo "=== schedules db ==="
     cat "$SCHEDULES_DB" 2>/dev/null || true
+    echo
+    echo "=== ip rules db ==="
+    cat "$IPRULES_DB" 2>/dev/null || true
     echo
     echo "=== conflict guard ==="
     run_conflict_guard || true
@@ -1531,6 +2057,11 @@ generate_debug_report() {
     echo "=== listening sockets ==="
     ss -lntup 2>/dev/null || true
     echo
+    if has_command nft; then
+      echo "=== nft table (${NFT_TABLE_FAMILY} ${NFT_TABLE_NAME}) ==="
+      nft list table "$NFT_TABLE_FAMILY" "$NFT_TABLE_NAME" 2>/dev/null || true
+      echo
+    fi
     if has_systemd; then
       echo "=== service status ==="
       systemctl status --no-pager limit-tc-port.service 2>/dev/null || true
@@ -1880,6 +2411,7 @@ rules_menu() {
     echo "[6] Delete rule"
     echo "[7] Apply enabled rules"
     echo "[8] Quick wizard"
+    echo "[9] IP/CIDR rules"
     echo "[0] Back"
     choice="$(prompt_input "Choice")"
     case "$choice" in
@@ -1901,6 +2433,47 @@ rules_menu() {
       6) delete_rule; pause_enter ;;
       7) apply_enabled_rules; pause_enter ;;
       8) quick_wizard; pause_enter ;;
+      9) ip_rules_menu ;;
+      0) return ;;
+      *) echo "Invalid option."; sleep 1 ;;
+    esac
+  done
+}
+
+ip_rules_menu() {
+  local choice iid
+  while true; do
+    menu_header "IP/CIDR Rules"
+    echo "Saved IP rules : $(count_saved_ip_rules)"
+    echo "Enabled        : $(count_enabled_ip_rules)"
+    echo
+    echo "[1] List IP rules"
+    echo "[2] Add IP/CIDR rule"
+    echo "[3] Edit IP/CIDR rule"
+    echo "[4] Enable IP/CIDR rule"
+    echo "[5] Disable IP/CIDR rule"
+    echo "[6] Delete IP/CIDR rule"
+    echo "[7] Apply enabled policies now"
+    echo "[0] Back"
+    choice="$(prompt_input "Choice")"
+    case "$choice" in
+      1) list_ip_rules; pause_enter ;;
+      2) add_ip_rule; pause_enter ;;
+      3) edit_ip_rule; pause_enter ;;
+      4)
+        list_ip_rules
+        iid="$(prompt_input "IP rule ID to enable")"
+        set_ip_rule_enabled "$iid" "1"
+        pause_enter
+        ;;
+      5)
+        list_ip_rules
+        iid="$(prompt_input "IP rule ID to disable")"
+        set_ip_rule_enabled "$iid" "0"
+        pause_enter
+        ;;
+      6) delete_ip_rule; pause_enter ;;
+      7) apply_enabled_rules; pause_enter ;;
       0) return ;;
       *) echo "Invalid option."; sleep 1 ;;
     esac
@@ -1978,12 +2551,14 @@ schedules_menu() {
 }
 
 render_dashboard() {
-  local selected_interface default_interface saved enabled disabled schedules schedules_active snapshots detected detected_source ifb_state host_name up_text
+  local selected_interface default_interface saved enabled disabled ip_saved ip_enabled schedules schedules_active snapshots detected detected_source ifb_state host_name up_text
   selected_interface="${INTERFACE:-N/A}"
   default_interface="$(detect_default_interface || true)"
   saved="$(count_saved_rules)"
   enabled="$(count_enabled_rules)"
   disabled="$(count_disabled_rules)"
+  ip_saved="$(count_saved_ip_rules)"
+  ip_enabled="$(count_enabled_ip_rules)"
   schedules="$(count_saved_schedules)"
   schedules_active="$(count_active_schedules_now)"
   snapshots="$(count_snapshots)"
@@ -2011,6 +2586,7 @@ render_dashboard() {
   printf "   Saved Rules    : %s\n" "$saved"
   printf "   Enabled Rules  : %b\n" "$(badge_state "enabled") ($enabled)"
   printf "   Disabled Rules : %b\n" "$(badge_state "disabled") ($disabled)"
+  printf "   IP/CIDR Rules  : %s (enabled: %s)\n" "$ip_saved" "$ip_enabled"
   printf "   Schedules      : %s (active now: %s)\n" "$schedules" "$schedules_active"
   printf "   Snapshots      : %s\n" "$snapshots"
   printf "   Protected Ports: %s (min %skbit)\n" "${PROTECTED_PORTS:-none}" "${MIN_PROTECTED_KBIT}"
@@ -2040,6 +2616,7 @@ Usage:
   $APP_NAME --clear          # clear tc rules
   $APP_NAME --status         # show tc status
   $APP_NAME --list           # list saved rules
+  $APP_NAME --list-ip-rules  # list saved IP/CIDR rules
   $APP_NAME --list-schedules # list saved schedule windows
   $APP_NAME --conflict-check # validate conflicts and protected-port safety
   $APP_NAME --list-snapshots # list stored policy snapshots
@@ -2117,6 +2694,10 @@ main() {
       ;;
     --list)
       list_rules
+      exit 0
+      ;;
+    --list-ip-rules)
+      list_ip_rules
       exit 0
       ;;
     --list-schedules)
