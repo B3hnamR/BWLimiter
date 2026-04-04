@@ -28,6 +28,7 @@
 | Rule Management | ساخت، ویرایش، حذف، فعال/غیرفعال، اعمال مجدد |
 | تشخیص Inbound | تشخیص هوشمند با اولویت محیط VPN/3x-ui |
 | زمان‌بندی | تعداد نامحدود پنجره زمانی برای هر Rule |
+| ایمنی | Conflict Guard + محافظت پورت‌های حیاتی + Safe Apply با Snapshot/Rollback |
 | مانیتورینگ | مشاهده زنده کلاس‌ها + گزارش کامل عیب‌یابی |
 | اتوماسیون | سرویس اصلی + تایمر هر دقیقه برای بررسی زمان‌بندی |
 
@@ -113,7 +114,7 @@ sudo limit-tc-port
 بخش‌های مهم:
 
 - `Service Ops`: مدیریت سرویس اصلی + تایمر زمان‌بندی
-- `Maintenance Toolkit`: انتخاب اینترفیس، تنظیم IFB، گزارش Debug
+- `Maintenance Toolkit`: انتخاب اینترفیس، تنظیم IFB، گزارش Debug، Safe Apply، بررسی Conflict، Snapshot/Rollback
 - `Time Schedules`: تعریف پنجره‌های زمانی روی Ruleها
 
 ---
@@ -141,11 +142,16 @@ sudo limit-tc-port
 
 ```bash
 sudo limit-tc-port --apply
+sudo limit-tc-port --safe-apply
 sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
 sudo limit-tc-port --list-schedules
+sudo limit-tc-port --conflict-check
+sudo limit-tc-port --list-snapshots
+sudo limit-tc-port --rollback-latest
+sudo limit-tc-port --rollback-snapshot <snapshot_id>
 sudo limit-tc-port --install-service
 sudo limit-tc-port --debug-report
 sudo limit-tc-port --help
@@ -154,7 +160,10 @@ sudo limit-tc-port --help
 توضیح سریع:
 
 - `--apply`: اعمال فوری تنظیمات موثر فعلی
+- `--safe-apply`: قبل از Apply از تنظیمات Snapshot می‌گیرد و در صورت خطا rollback می‌کند
 - `--tick`: فقط در صورت تغییر واقعی زمان‌بندی دوباره apply می‌کند
+- `--conflict-check`: تداخل Ruleها و ریسک پورت‌های محافظت‌شده را قبل از Apply بررسی می‌کند
+- `--rollback-*`: بازگردانی تنظیمات از Snapshotهای قبلی
 - `--debug-report`: گزارش کامل در `/tmp` می‌سازد
 
 ---

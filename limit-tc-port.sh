@@ -8,6 +8,7 @@ CONFIG_DIR="/etc/limit-tc-port"
 CONFIG_FILE="$CONFIG_DIR/config"
 RULES_DB="$CONFIG_DIR/rules.db"
 SCHEDULES_DB="$CONFIG_DIR/schedules.db"
+SNAPSHOTS_DIR="$CONFIG_DIR/snapshots"
 LOG_FILE="/var/log/limit-tc-port.log"
 SERVICE_FILE="/etc/systemd/system/limit-tc-port.service"
 SCHEDULER_SERVICE_FILE="/etc/systemd/system/limit-tc-port-scheduler.service"
@@ -19,6 +20,8 @@ SCHEDULE_HASH_FILE="$STATE_DIR/schedule.hash"
 INTERFACE=""
 IFB_DEV="ifb0"
 LINK_CEIL="10000mbit"
+PROTECTED_PORTS="22"
+MIN_PROTECTED_KBIT="128"
 
 RED="\033[1;31m"
 GREEN="\033[1;32m"
@@ -88,6 +91,7 @@ has_command() {
 
 ensure_storage() {
   mkdir -p "$CONFIG_DIR"
+  mkdir -p "$SNAPSHOTS_DIR"
   mkdir -p "$STATE_DIR" >/dev/null 2>&1 || true
   touch "$LOG_FILE"
   if [[ ! -f "$RULES_DB" ]]; then
@@ -107,6 +111,8 @@ save_config() {
 INTERFACE="${INTERFACE}"
 IFB_DEV="${IFB_DEV}"
 LINK_CEIL="${LINK_CEIL}"
+PROTECTED_PORTS="${PROTECTED_PORTS}"
+MIN_PROTECTED_KBIT="${MIN_PROTECTED_KBIT}"
 EOF
 }
 
@@ -121,6 +127,8 @@ load_config() {
   fi
   IFB_DEV="${IFB_DEV:-ifb0}"
   LINK_CEIL="${LINK_CEIL:-10000mbit}"
+  PROTECTED_PORTS="${PROTECTED_PORTS:-22}"
+  MIN_PROTECTED_KBIT="${MIN_PROTECTED_KBIT:-128}"
 }
 
 is_non_negative_int() {
@@ -160,6 +168,244 @@ count_saved_schedules() {
 
 count_enabled_schedules() {
   schedules_lines | awk -F'|' '$3=="1"{c++} END{print c+0}'
+}
+
+count_snapshots() {
+  find "$SNAPSHOTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | awk '{print $1}'
+}
+
+is_port_protected() {
+  local port="$1"
+  local list
+  list="$(echo "${PROTECTED_PORTS:-}" | tr -d '[:space:]')"
+  [[ -z "$list" ]] && return 1
+  [[ ",$list," == *",$port,"* ]]
+}
+
+detect_rule_port_proto_overlaps() {
+  rules_lines | awk -F'|' '
+  $2=="1" {
+    split($4, arr, ",");
+    for (i in arr) {
+      p=arr[i];
+      if (p !~ /^[0-9]+$/) continue;
+      if ($5=="both") {
+        print p "|tcp|" $1;
+        print p "|udp|" $1;
+      } else if ($5=="tcp" || $5=="udp") {
+        print p "|" $5 "|" $1;
+      }
+    }
+  }' \
+  | sort -t'|' -k1,1n -k2,2 \
+  | awk -F'|' '
+  {
+    k=$1 "|" $2;
+    c[k]++;
+    if (ids[k]=="") ids[k]=$3;
+    else ids[k]=ids[k] "," $3;
+  }
+  END {
+    for (k in c) {
+      if (c[k] > 1) print k "|" ids[k];
+    }
+  }'
+}
+
+detect_schedule_same_priority_groups() {
+  schedules_lines | awk -F'|' '
+  $3=="1" {
+    k=$2 "|" $11;
+    c[k]++;
+    if (ids[k]=="") ids[k]=$1;
+    else ids[k]=ids[k] "," $1;
+  }
+  END {
+    for (k in c) if (c[k] > 1) print k "|" ids[k];
+  }'
+}
+
+run_conflict_guard() {
+  local failed=0
+  local min_kbit
+  local overlaps same_prio
+
+  min_kbit="${MIN_PROTECTED_KBIT:-128}"
+  if ! is_non_negative_int "$min_kbit" || [[ "$min_kbit" -eq 0 ]]; then
+    min_kbit=128
+  fi
+
+  overlaps="$(detect_rule_port_proto_overlaps)"
+  if [[ -n "$overlaps" ]]; then
+    print_err "Conflict guard: overlapping enabled rules detected (same port/proto in multiple rules)."
+    while IFS='|' read -r port proto ids; do
+      [[ -n "${port:-}" ]] || continue
+      echo "  - port=$port proto=$proto rules=$ids"
+    done <<<"$overlaps"
+    failed=1
+  fi
+
+  local id enabled name ports proto down up burst created updated
+  local resolved eff_down eff_up eff_burst source sid label p port
+  while IFS='|' read -r id enabled name ports proto down up burst created updated; do
+    [[ "$enabled" == "1" ]] || continue
+    ports="$(normalize_ports "$ports")"
+    [[ -n "$ports" ]] || continue
+    validate_proto "$proto" || continue
+
+    if ! is_non_negative_int "$down"; then down=0; fi
+    if ! is_non_negative_int "$up"; then up=0; fi
+    if ! is_non_negative_int "$burst"; then burst=32; fi
+    [[ "$burst" -eq 0 ]] && burst=32
+
+    resolved="$(resolve_effective_limits "$id" "$down" "$up" "$burst")"
+    IFS='|' read -r eff_down eff_up eff_burst source sid label <<<"$resolved"
+
+    for port in ${ports//,/ }; do
+      for p in $(proto_words "$proto"); do
+        [[ "$p" == "tcp" ]] || continue
+        is_port_protected "$port" || continue
+        if (( eff_down < min_kbit || eff_up < min_kbit )); then
+          print_err "Conflict guard: protected port $port (rule $id) has low effective limit down=$eff_down up=$eff_up kbit (min=$min_kbit)."
+          failed=1
+        fi
+      done
+    done
+  done < <(rules_lines)
+
+  same_prio="$(detect_schedule_same_priority_groups)"
+  if [[ -n "$same_prio" ]]; then
+    print_warn "Schedule guard: multiple enabled schedules share same rule+priority. Behavior is deterministic but easy to misconfigure."
+    while IFS='|' read -r rid prio sids; do
+      [[ -n "${rid:-}" ]] || continue
+      echo "  - rule=$rid priority=$prio schedules=$sids"
+    done <<<"$same_prio"
+  fi
+
+  if [[ "$failed" -ne 0 ]]; then
+    print_err "Conflict guard blocked apply."
+    return 1
+  fi
+  print_ok "Conflict guard passed."
+  return 0
+}
+
+create_policy_snapshot() {
+  local label="${1:-manual}"
+  local sid dir
+  sid="$(date +%Y%m%d-%H%M%S)"
+  dir="$SNAPSHOTS_DIR/$sid"
+  if [[ -d "$dir" ]]; then
+    sid="${sid}-$$"
+    dir="$SNAPSHOTS_DIR/$sid"
+  fi
+
+  mkdir -p "$dir" || return 1
+  [[ -f "$CONFIG_FILE" ]] && cp "$CONFIG_FILE" "$dir/config" >/dev/null 2>&1 || true
+  [[ -f "$RULES_DB" ]] && cp "$RULES_DB" "$dir/rules.db" >/dev/null 2>&1 || true
+  [[ -f "$SCHEDULES_DB" ]] && cp "$SCHEDULES_DB" "$dir/schedules.db" >/dev/null 2>&1 || true
+
+  {
+    echo "id=$sid"
+    echo "created_at=$(ts)"
+    echo "label=$label"
+    echo "interface=${INTERFACE:-N/A}"
+    echo "ifb=${IFB_DEV:-N/A}"
+    echo "rules=$(count_saved_rules)"
+    echo "schedules=$(count_saved_schedules)"
+  } >"$dir/meta.env"
+
+  if [[ -n "${INTERFACE:-}" ]]; then
+    tc qdisc show dev "$INTERFACE" >"$dir/tc-main.qdisc" 2>/dev/null || true
+    tc class show dev "$INTERFACE" >"$dir/tc-main.class" 2>/dev/null || true
+    tc filter show dev "$INTERFACE" parent 1: >"$dir/tc-main.filter" 2>/dev/null || true
+  fi
+  tc qdisc show dev "$IFB_DEV" >"$dir/tc-ifb.qdisc" 2>/dev/null || true
+  tc class show dev "$IFB_DEV" >"$dir/tc-ifb.class" 2>/dev/null || true
+  tc filter show dev "$IFB_DEV" parent 2: >"$dir/tc-ifb.filter" 2>/dev/null || true
+
+  echo "$sid"
+}
+
+list_snapshots() {
+  local found=0 dir sid label created
+  printf "%-24s %-20s %-28s\n" "SNAPSHOT_ID" "CREATED_AT" "LABEL"
+  printf "%-24s %-20s %-28s\n" "------------------------" "--------------------" "----------------------------"
+  while IFS= read -r dir; do
+    found=1
+    sid="$(basename "$dir")"
+    label="-"
+    created="-"
+    if [[ -f "$dir/meta.env" ]]; then
+      label="$(grep -E '^label=' "$dir/meta.env" | head -n1 | cut -d'=' -f2-)"
+      created="$(grep -E '^created_at=' "$dir/meta.env" | head -n1 | cut -d'=' -f2-)"
+      [[ -z "$label" ]] && label="-"
+      [[ -z "$created" ]] && created="-"
+    fi
+    printf "%-24s %-20s %-28s\n" "$sid" "$created" "$label"
+  done < <(find "$SNAPSHOTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r)
+  if [[ "$found" -eq 0 ]]; then
+    echo "No snapshots found."
+  fi
+}
+
+restore_policy_snapshot_files() {
+  local sid="$1"
+  local dir="$SNAPSHOTS_DIR/$sid"
+  [[ -d "$dir" ]] || {
+    print_err "Snapshot not found: $sid"
+    return 1
+  }
+
+  [[ -f "$dir/config" ]] && cp "$dir/config" "$CONFIG_FILE"
+  [[ -f "$dir/rules.db" ]] && cp "$dir/rules.db" "$RULES_DB"
+  [[ -f "$dir/schedules.db" ]] && cp "$dir/schedules.db" "$SCHEDULES_DB"
+  load_config
+  return 0
+}
+
+rollback_to_snapshot() {
+  local sid="$1"
+  restore_policy_snapshot_files "$sid" || return 1
+  apply_enabled_rules 1 || {
+    print_err "Rollback applied files but tc apply failed."
+    return 1
+  }
+  print_ok "Rollback completed from snapshot: $sid"
+  return 0
+}
+
+latest_snapshot_id() {
+  find "$SNAPSHOTS_DIR" -mindepth 1 -maxdepth 1 -type d 2>/dev/null | sort -r | head -n1 | awk -F'/' '{print $NF}'
+}
+
+rollback_latest_snapshot() {
+  local sid
+  sid="$(latest_snapshot_id)"
+  if [[ -z "$sid" ]]; then
+    print_err "No snapshots available."
+    return 1
+  fi
+  rollback_to_snapshot "$sid"
+}
+
+safe_apply() {
+  local sid
+  run_conflict_guard || return 1
+
+  sid="$(create_policy_snapshot "safe-apply-pre")" || {
+    print_err "Could not create snapshot."
+    return 1
+  }
+  print_ok "Snapshot created: $sid"
+
+  if apply_enabled_rules 1; then
+    print_ok "Safe apply completed."
+    return 0
+  fi
+
+  print_err "Apply failed. Rolling back to snapshot $sid..."
+  rollback_to_snapshot "$sid"
 }
 
 ifb_status() {
@@ -1131,6 +1377,7 @@ tick_apply_if_needed() {
 }
 
 apply_enabled_rules() {
+  local skip_guard="${1:-0}"
   local cid_up=100
   local cid_down=100
   local prio_up=100
@@ -1144,6 +1391,10 @@ apply_enabled_rules() {
   if ! ip link show "$INTERFACE" >/dev/null 2>&1; then
     print_err "Interface $INTERFACE not found."
     return 1
+  fi
+
+  if [[ "$skip_guard" != "1" ]]; then
+    run_conflict_guard || return 1
   fi
 
   setup_ifb || return 1
@@ -1242,7 +1493,10 @@ generate_debug_report() {
     echo "ifb: ${IFB_DEV}"
     echo "ifb-status: $(ifb_status)"
     echo "link-ceil: ${LINK_CEIL}"
+    echo "protected_ports: ${PROTECTED_PORTS:-none}"
+    echo "min_protected_kbit: ${MIN_PROTECTED_KBIT}"
     echo "schedules: saved=$(count_saved_schedules) enabled=$(count_enabled_schedules) active_now=$(count_active_schedules_now)"
+    echo "snapshots: $(count_snapshots)"
     echo
     echo "=== detected inbounds ($(detected_source_label)) ==="
     detect_inbounds || true
@@ -1252,6 +1506,9 @@ generate_debug_report() {
     echo
     echo "=== schedules db ==="
     cat "$SCHEDULES_DB" 2>/dev/null || true
+    echo
+    echo "=== conflict guard ==="
+    run_conflict_guard || true
     echo
     echo "=== tc qdisc (main) ==="
     tc qdisc show dev "$INTERFACE" 2>/dev/null || true
@@ -1346,6 +1603,27 @@ pick_interface() {
       return 0
     fi
     echo "Invalid selection."
+  done
+}
+
+set_protected_ports_config() {
+  local value
+  while true; do
+    value="$(prompt_input "Protected ports (comma separated, empty=disable)" "$PROTECTED_PORTS")"
+    value="$(echo "$value" | tr -d '[:space:]')"
+    if [[ -z "$value" ]]; then
+      PROTECTED_PORTS=""
+      save_config
+      print_warn "Protected ports disabled."
+      return 0
+    fi
+    if validate_ports "$value"; then
+      PROTECTED_PORTS="$(normalize_ports "$value")"
+      save_config
+      print_ok "Protected ports set: $PROTECTED_PORTS"
+      return 0
+    fi
+    echo "Invalid port list."
   done
 }
 
@@ -1518,7 +1796,7 @@ service_menu() {
 }
 
 maintenance_menu() {
-  local choice value
+  local choice value sid
   while true; do
     menu_header "Maintenance Toolkit"
     echo "[1] Apply enabled rules now"
@@ -1529,6 +1807,13 @@ maintenance_menu() {
     echo "[6] Set IFB device"
     echo "[7] Set link ceiling"
     echo "[8] Generate debug report"
+    echo "[9] Safe apply (snapshot + rollback on fail)"
+    echo "[10] Run conflict guard check"
+    echo "[11] Set protected ports"
+    echo "[12] Set minimum protected kbit"
+    echo "[13] List snapshots"
+    echo "[14] Rollback latest snapshot"
+    echo "[15] Rollback selected snapshot"
     echo "[0] Back"
     choice="$(prompt_input "Choice")"
     case "$choice" in
@@ -1553,6 +1838,28 @@ maintenance_menu() {
         ;;
       8)
         generate_debug_report
+        pause_enter
+        ;;
+      9) safe_apply; pause_enter ;;
+      10) run_conflict_guard; pause_enter ;;
+      11) set_protected_ports_config; pause_enter ;;
+      12)
+        value="$(prompt_non_negative_int "Minimum protected kbit" "$MIN_PROTECTED_KBIT")"
+        if [[ "$value" -eq 0 ]]; then
+          print_warn "0 is not allowed for protected minimum. Keeping previous value."
+        else
+          MIN_PROTECTED_KBIT="$value"
+          save_config
+          print_ok "Minimum protected kbit set to $MIN_PROTECTED_KBIT"
+        fi
+        pause_enter
+        ;;
+      13) list_snapshots; pause_enter ;;
+      14) rollback_latest_snapshot; pause_enter ;;
+      15)
+        list_snapshots
+        sid="$(prompt_input "Snapshot ID to rollback")"
+        rollback_to_snapshot "$sid"
         pause_enter
         ;;
       0) return ;;
@@ -1671,7 +1978,7 @@ schedules_menu() {
 }
 
 render_dashboard() {
-  local selected_interface default_interface saved enabled disabled schedules schedules_active detected detected_source ifb_state host_name up_text
+  local selected_interface default_interface saved enabled disabled schedules schedules_active snapshots detected detected_source ifb_state host_name up_text
   selected_interface="${INTERFACE:-N/A}"
   default_interface="$(detect_default_interface || true)"
   saved="$(count_saved_rules)"
@@ -1679,6 +1986,7 @@ render_dashboard() {
   disabled="$(count_disabled_rules)"
   schedules="$(count_saved_schedules)"
   schedules_active="$(count_active_schedules_now)"
+  snapshots="$(count_snapshots)"
   detected="$(detected_ports_csv)"
   detected_source="$(detected_source_label)"
   detected="${detected:-none}"
@@ -1704,6 +2012,8 @@ render_dashboard() {
   printf "   Enabled Rules  : %b\n" "$(badge_state "enabled") ($enabled)"
   printf "   Disabled Rules : %b\n" "$(badge_state "disabled") ($disabled)"
   printf "   Schedules      : %s (active now: %s)\n" "$schedules" "$schedules_active"
+  printf "   Snapshots      : %s\n" "$snapshots"
+  printf "   Protected Ports: %s (min %skbit)\n" "${PROTECTED_PORTS:-none}" "${MIN_PROTECTED_KBIT}"
   printf "   Detected Ports : %s\n" "$detected"
   printf "   Detected Source: %s\n" "$detected_source"
   echo
@@ -1725,11 +2035,16 @@ Developed by: $APP_AUTHOR
 Usage:
   $APP_NAME                  # interactive menu
   $APP_NAME --apply          # apply enabled rules
+  $APP_NAME --safe-apply     # snapshot + guarded apply + auto rollback on failure
   $APP_NAME --tick           # apply only if schedule state changed
   $APP_NAME --clear          # clear tc rules
   $APP_NAME --status         # show tc status
   $APP_NAME --list           # list saved rules
   $APP_NAME --list-schedules # list saved schedule windows
+  $APP_NAME --conflict-check # validate conflicts and protected-port safety
+  $APP_NAME --list-snapshots # list stored policy snapshots
+  $APP_NAME --rollback-latest
+  $APP_NAME --rollback-snapshot <snapshot_id>
   $APP_NAME --install-service
   $APP_NAME --debug-report   # generate debug report in /tmp
   $APP_NAME --help
@@ -1776,6 +2091,12 @@ main() {
       apply_enabled_rules
       exit $?
       ;;
+    --safe-apply)
+      require_root
+      require_commands
+      safe_apply
+      exit $?
+      ;;
     --tick)
       require_root
       require_commands
@@ -1801,6 +2122,32 @@ main() {
     --list-schedules)
       list_schedules
       exit 0
+      ;;
+    --conflict-check)
+      require_root
+      require_commands
+      run_conflict_guard
+      exit $?
+      ;;
+    --list-snapshots)
+      list_snapshots
+      exit 0
+      ;;
+    --rollback-latest)
+      require_root
+      require_commands
+      rollback_latest_snapshot
+      exit $?
+      ;;
+    --rollback-snapshot)
+      require_root
+      require_commands
+      if [[ -z "${2:-}" ]]; then
+        print_err "Missing snapshot id."
+        exit 1
+      fi
+      rollback_to_snapshot "$2"
+      exit $?
       ;;
     --install-service)
       require_root

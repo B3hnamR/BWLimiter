@@ -32,6 +32,7 @@ The script is designed for real server operations, including VPN stacks like x-u
 | Multi-port support | One rule can target multiple ports |
 | Inbound discovery | VPN-aware discovery + 3x-ui DB/config parsing fallback chain |
 | Scheduling | Unlimited time windows per rule, day filters, overlap priority |
+| Safety | Conflict guard + protected-port policy + safe apply with snapshot rollback |
 | Monitoring | Live `tc` monitor, status view, debug report generator |
 | Automation | `systemd` service + 1-minute scheduler timer |
 
@@ -117,7 +118,7 @@ Main menu:
 Important submenus:
 
 - `Service Ops`: service install/start/stop + scheduler timer control
-- `Maintenance Toolkit`: interface selection, IFB config, debug report
+- `Maintenance Toolkit`: interface selection, IFB config, debug report, safe apply, conflict checks, snapshot rollback
 - `Time Schedules`: create/edit/enable/disable/delete schedule windows
 
 ---
@@ -145,11 +146,16 @@ Behavior:
 
 ```bash
 sudo limit-tc-port --apply
+sudo limit-tc-port --safe-apply
 sudo limit-tc-port --tick
 sudo limit-tc-port --clear
 sudo limit-tc-port --status
 sudo limit-tc-port --list
 sudo limit-tc-port --list-schedules
+sudo limit-tc-port --conflict-check
+sudo limit-tc-port --list-snapshots
+sudo limit-tc-port --rollback-latest
+sudo limit-tc-port --rollback-snapshot <snapshot_id>
 sudo limit-tc-port --install-service
 sudo limit-tc-port --debug-report
 sudo limit-tc-port --help
@@ -158,7 +164,10 @@ sudo limit-tc-port --help
 Command intent:
 
 - `--apply`: force apply current effective policy
+- `--safe-apply`: create snapshot, run guarded apply, auto-rollback if apply fails
 - `--tick`: apply only when effective schedule state changes
+- `--conflict-check`: validate overlapping rules and protected-port safety before apply
+- `--rollback-*`: restore previous policy from snapshots
 - `--debug-report`: generate diagnostics in `/tmp`
 
 ---
